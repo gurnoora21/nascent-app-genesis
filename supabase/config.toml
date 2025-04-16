@@ -1,1 +1,17 @@
+
 project_id = "nsxxzhhbcwzatvlulfyp"
+
+[functions.discover-artists]
+verify_jwt = false
+
+[functions.process-artist]
+verify_jwt = false
+
+[functions.process-batch]
+verify_jwt = false
+
+[functions.identify-producers]
+verify_jwt = false
+
+[functions.process-tracks-batch]
+verify_jwt = false
