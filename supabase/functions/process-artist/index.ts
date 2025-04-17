@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { RetryHelper, SpotifyClient, supabase } from "../lib/api-clients.ts";
 
@@ -20,18 +19,21 @@ function chunkArray<T>(array: T[], chunkSize: number): T[][] {
 }
 
 /**
- * Process artist albums helper function
+ * Enhanced process artist albums helper function with improved pagination
  */
 async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Promise<any[]> {
   let allAlbums = [];
   let offset = 0;
-  const limit = 20; // Smaller chunks for better stability
+  const limit = 50; // Increased to maximum allowed by Spotify API
   let hasMore = true;
   let totalAlbums = 0;
+  let retryCount = 0;
+  const maxRetries = 3;
+  let failedBatches = 0;
 
   console.log(`Fetching albums for artist ${spotifyId} in chunks of ${limit} (including appears_on and compilations)`);
   
-  while (hasMore) {
+  while (hasMore && failedBatches < 5) { // Added limit on failed batches
     try {
       // Use retryOperation for album fetching with backoff
       const albumsResponse = await RetryHelper.retryOperation(
@@ -46,8 +48,16 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         `Fetch albums batch at offset ${offset}`
       );
       
+      // Enhanced validation of response
+      if (!albumsResponse) {
+        console.error(`Empty response received for albums at offset ${offset}`);
+        failedBatches++;
+        offset += limit; // Still increment to try next batch
+        continue;
+      }
+      
       // Validate response has items array
-      if (!albumsResponse?.items || albumsResponse.items.length === 0) {
+      if (!Array.isArray(albumsResponse?.items) || albumsResponse.items.length === 0) {
         console.log(`No more albums found at offset ${offset}`);
         hasMore = false;
         break;
@@ -59,21 +69,49 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         console.log(`Artist has ${totalAlbums} total albums to process`);
       }
       
-      // Add retrieved albums to our collection
-      const validAlbums = albumsResponse.items.filter(item => !!item && !!item.id);
-      allAlbums.push(...validAlbums);
+      // Add retrieved albums to our collection with better filtering
+      const validAlbums = albumsResponse.items.filter(item => {
+        if (!item || !item.id) {
+          console.warn(`Invalid album entry found in response`);
+          return false;
+        }
+        return true;
+      });
+      
+      // Log duplicate detection during collection phase
+      const existingIds = new Set(allAlbums.map(a => a.id));
+      const newAlbums = validAlbums.filter(album => !existingIds.has(album.id));
+      const duplicates = validAlbums.length - newAlbums.length;
+      
+      if (duplicates > 0) {
+        console.log(`Found ${duplicates} duplicate albums in this batch that were filtered out`);
+      }
+      
+      allAlbums.push(...newAlbums);
       
       if (validAlbums.length < albumsResponse.items.length) {
         console.warn(`Filtered out ${albumsResponse.items.length - validAlbums.length} invalid album entries`);
       }
       
       offset += limit;
-      console.log(`Fetched ${allAlbums.length}/${totalAlbums} albums so far`);
+      console.log(`Fetched ${allAlbums.length}/${totalAlbums} albums so far (offset: ${offset})`);
       
-      // Check if there are more albums to fetch (both by items count and next URL)
-      hasMore = validAlbums.length === limit && !!albumsResponse.next;
+      // Enhanced check if there are more albums to fetch
+      hasMore = validAlbums.length > 0 && 
+               (albumsResponse.next || offset < totalAlbums);
+      
+      // Reset retry counter on success
+      retryCount = 0;
     } catch (albumFetchError) {
       console.error(`Error fetching albums at offset ${offset}:`, albumFetchError);
+      
+      retryCount++;
+      if (retryCount >= maxRetries) {
+        console.warn(`Max retries (${maxRetries}) reached for offset ${offset}, moving to next batch`);
+        offset += limit; // Skip this batch after multiple failures
+        retryCount = 0;
+        failedBatches++;
+      }
       
       // Log the error but continue with the albums we already have
       await supabase.rpc("log_error", {
@@ -81,31 +119,63 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         p_source: "process_artist",
         p_message: `Error fetching albums batch`,
         p_stack_trace: albumFetchError.stack || "",
-        p_context: { spotifyId, offset, limit },
+        p_context: { spotifyId, offset, limit, retryCount, failedBatches },
         p_item_id: spotifyId,
         p_item_type: "artist"
       });
       
-      // Break the loop but continue processing with what we have
-      break;
+      // Short delay before retry or continuing
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
 
-  console.log(`Found ${allAlbums.length} albums for artist`);
-  return allAlbums;
+  // Final deduplication pass to ensure no duplicates
+  const uniqueAlbumIds = new Set<string>();
+  const uniqueAlbums = [];
+  
+  for (const album of allAlbums) {
+    if (!uniqueAlbumIds.has(album.id)) {
+      uniqueAlbumIds.add(album.id);
+      uniqueAlbums.push(album);
+    }
+  }
+  
+  console.log(`Found ${uniqueAlbums.length} unique albums for artist (${allAlbums.length} total with duplicates removed)`);
+  
+  // Add detailed analytics
+  const albumTypes = {
+    album: 0,
+    single: 0,
+    compilation: 0,
+    appears_on: 0
+  };
+  
+  uniqueAlbums.forEach(album => {
+    if (album.album_type && albumTypes.hasOwnProperty(album.album_type)) {
+      albumTypes[album.album_type]++;
+    }
+  });
+  
+  console.log(`Album type breakdown: ${JSON.stringify(albumTypes)}`);
+  
+  return uniqueAlbums;
 }
 
 /**
- * Process album tracks helper function
+ * Enhanced process album tracks helper function with better pagination
  */
 async function fetchAlbumTracks(spotify: SpotifyClient, albumId: string): Promise<any[]> {
   let albumTracks = [];
   let trackOffset = 0;
-  const trackLimit = 20; // Smaller chunks
+  const trackLimit = 50; // Increased to Spotify's maximum
   let hasMoreTracks = true;
   let totalTracks = 0;
+  let retryCount = 0;
+  const maxRetries = 3;
 
   try {
+    console.log(`Starting to fetch tracks for album ${albumId}`);
+    
     while (hasMoreTracks) {
       try {
         // Use retry operation for track fetching
@@ -116,7 +186,21 @@ async function fetchAlbumTracks(spotify: SpotifyClient, albumId: string): Promis
           `Fetch tracks for album ${albumId} at offset ${trackOffset}`
         );
         
-        if (!tracksResponse?.items || tracksResponse.items.length === 0) {
+        // Enhanced validation of response
+        if (!tracksResponse) {
+          console.error(`Empty response for album tracks at offset ${trackOffset}`);
+          if (++retryCount >= maxRetries) {
+            console.warn(`Max retries (${maxRetries}) reached for album ${albumId} at offset ${trackOffset}, stopping`);
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
+        
+        // Reset retry counter on success
+        retryCount = 0;
+        
+        if (!Array.isArray(tracksResponse?.items) || tracksResponse.items.length === 0) {
           console.log(`No more tracks found for album ${albumId} at offset ${trackOffset}`);
           hasMoreTracks = false;
           break;
@@ -128,47 +212,89 @@ async function fetchAlbumTracks(spotify: SpotifyClient, albumId: string): Promis
           console.log(`Album has ${totalTracks} total tracks to process`);
         }
         
-        // Add retrieved tracks to our collection
-        const validTracks = tracksResponse.items.filter(item => !!item && !!item.id);
-        albumTracks.push(...validTracks);
+        // Add retrieved tracks to our collection with better filtering
+        const validTracks = tracksResponse.items.filter(item => {
+          if (!item || !item.id) {
+            console.warn(`Invalid track entry found in album ${albumId}`);
+            return false;
+          }
+          return true;
+        });
+        
+        // Check for duplicate tracks within this batch
+        const existingIds = new Set(albumTracks.map(t => t.id));
+        const newTracks = validTracks.filter(track => !existingIds.has(track.id));
+        const duplicates = validTracks.length - newTracks.length;
+        
+        if (duplicates > 0) {
+          console.log(`Found ${duplicates} duplicate tracks in this album batch that were filtered out`);
+        }
+        
+        albumTracks.push(...newTracks);
         
         if (validTracks.length < tracksResponse.items.length) {
           console.warn(`Filtered out ${tracksResponse.items.length - validTracks.length} invalid track entries`);
         }
         
         trackOffset += trackLimit;
+        console.log(`Fetched ${albumTracks.length}/${totalTracks} tracks for album ${albumId} so far`);
         
-        // Check if there are more tracks to fetch
-        hasMoreTracks = validTracks.length === trackLimit && !!tracksResponse.next;
+        // Enhanced check if there are more tracks to fetch
+        hasMoreTracks = validTracks.length > 0 && 
+                       (tracksResponse.next || trackOffset < totalTracks);
+        
       } catch (tracksError) {
         console.error(`Error fetching tracks for album ${albumId} at offset ${trackOffset}:`, tracksError);
+        
+        retryCount++;
+        if (retryCount >= maxRetries) {
+          console.warn(`Max retries (${maxRetries}) reached for album ${albumId} at offset ${trackOffset}, moving to next offset`);
+          trackOffset += trackLimit;
+          retryCount = 0;
+        }
         
         await supabase.rpc("log_error", {
           p_error_type: "processing",
           p_source: "process_artist",
           p_message: `Error fetching album tracks`,
           p_stack_trace: tracksError.stack || "",
-          p_context: { albumId, offset: trackOffset },
+          p_context: { albumId, offset: trackOffset, retryCount },
           p_item_id: albumId,
           p_item_type: "album"
         });
         
-        // Skip to next offset or break if too many errors
-        if (trackOffset === 0) {
-          // If we couldn't get any tracks, break out
+        // Short delay before retry
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // If we couldn't get any tracks after multiple retries, break out
+        if (trackOffset === 0 && retryCount >= maxRetries) {
           break;
         }
-        
-        // Increment and continue
-        trackOffset += trackLimit;
       }
     }
+    
+    // Final deduplication pass
+    const uniqueTrackIds = new Set<string>();
+    const uniqueTracks = [];
+    
+    for (const track of albumTracks) {
+      if (!uniqueTrackIds.has(track.id)) {
+        uniqueTrackIds.add(track.id);
+        uniqueTracks.push(track);
+      }
+    }
+    
+    if (uniqueTracks.length !== albumTracks.length) {
+      console.log(`Removed ${albumTracks.length - uniqueTracks.length} duplicate tracks from album ${albumId}`);
+    }
+    
+    console.log(`Found ${uniqueTracks.length} unique tracks for album ${albumId}`);
+    return uniqueTracks;
+    
   } catch (error) {
     console.error(`Error in fetchAlbumTracks for album ${albumId}:`, error);
+    return [];
   }
-
-  console.log(`Found ${albumTracks.length} tracks for album ${albumId}`);
-  return albumTracks;
 }
 
 /**
@@ -232,19 +358,25 @@ async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Pro
 }
 
 /**
- * Process tracks from an album
+ * Enhanced process tracks from an album function with better deduplication
  */
 async function processAlbumTracks(
   spotify: SpotifyClient, 
   album: any, 
   artistRecord: any, 
   artistCache: Map<string, string>,
-  processedTrackIds: Set<string>
+  processedTrackIds: Set<string>,
+  trackStats: {
+    total: number;
+    new: number;
+    duplicates: number;
+    byAlbumType: Record<string, number>;
+  }
 ): Promise<any[]> {
   const processedTracks = [];
   
   try {
-    console.log(`Processing tracks for album "${album.name}" (ID: ${album.id})`);
+    console.log(`Processing tracks for album "${album.name}" (ID: ${album.id}, Type: ${album.album_type})`);
     
     // Get all tracks for this album
     const albumTracks = await fetchAlbumTracks(spotify, album.id);
@@ -254,23 +386,43 @@ async function processAlbumTracks(
       return [];
     }
     
-    // Filter out tracks we've already processed
-    const newTracks = albumTracks.filter(track => 
-      track && track.id && !processedTrackIds.has(track.id)
-    );
+    // Enhanced duplicate detection logging
+    const newTracks = [];
+    const duplicateTracks = [];
+    
+    // Filter out tracks we've already processed with better logging
+    for (const track of albumTracks) {
+      if (!track || !track.id) {
+        console.warn(`Invalid track data in album ${album.name}`);
+        continue;
+      }
+      
+      if (processedTrackIds.has(track.id)) {
+        duplicateTracks.push(track);
+      } else {
+        newTracks.push(track);
+        processedTrackIds.add(track.id);
+      }
+    }
+    
+    // Update statistics
+    trackStats.total += albumTracks.length;
+    trackStats.new += newTracks.length;
+    trackStats.duplicates += duplicateTracks.length;
+    
+    // Track by album type
+    const albumType = album.album_type || 'unknown';
+    trackStats.byAlbumType[albumType] = (trackStats.byAlbumType[albumType] || 0) + newTracks.length;
+    
+    console.log(`Found ${newTracks.length} new tracks and ${duplicateTracks.length} duplicates in album "${album.name}"`);
     
     if (newTracks.length === 0) {
       console.log(`No new tracks to process in album "${album.name}"`);
       return [];
     }
     
-    console.log(`Found ${newTracks.length} new tracks in album "${album.name}"`);
-    
-    // Mark these tracks as processed
-    newTracks.forEach(track => track.id && processedTrackIds.add(track.id));
-    
     // Process tracks in smaller batches
-    const trackChunks = chunkArray(newTracks, 20); // Reduced from 50 to 20 for better reliability
+    const trackChunks = chunkArray(newTracks, 20);
     
     for (const [chunkIndex, trackChunk] of trackChunks.entries()) {
       console.log(`Processing track chunk ${chunkIndex + 1}/${trackChunks.length} for album "${album.name}"`);
@@ -435,7 +587,7 @@ async function processAlbumTracks(
   return processedTracks;
 }
 
-// Process a specific artist by Spotify ID
+// Process a specific artist by Spotify ID with enhanced validation
 async function processArtist(spotifyId: string): Promise<{success: boolean, message: string, data?: any}> {
   try {
     console.log(`Processing artist with Spotify ID: ${spotifyId}`);
@@ -449,7 +601,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
     const artistCache = new Map<string, string>();
     artistCache.set(spotifyId, artistRecord.id);
 
-    // Get all artist albums from Spotify
+    // Enhanced getting all artist albums from Spotify
     const allAlbums = await fetchArtistAlbums(spotify, spotifyId);
     
     console.log(`Processing ${allAlbums.length} albums for artist ${artistRecord.name}`);
@@ -458,11 +610,29 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
     const processedTrackIds = new Set<string>();
     const processedTracks = [];
     
+    // Enhanced tracking statistics
+    const trackStats = {
+      total: 0,
+      new: 0,
+      duplicates: 0,
+      byAlbumType: {
+        album: 0,
+        single: 0,
+        compilation: 0,
+        appears_on: 0,
+        unknown: 0
+      }
+    };
+    
     // Process albums in smaller chunks to avoid timeouts
-    const albumChunkSize = 3; // Reduced from 5 to 3
+    const albumChunkSize = 3; // Kept at 3 as per original code
     const albumChunks = chunkArray(allAlbums, albumChunkSize);
     
     console.log(`Split ${allAlbums.length} albums into ${albumChunks.length} chunks of size ${albumChunkSize}`);
+    
+    // Counters for error tracking
+    let successfulAlbums = 0;
+    let failedAlbums = 0;
     
     for (let i = 0; i < albumChunks.length; i++) {
       const albumChunk = albumChunks[i];
@@ -472,6 +642,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       const albumPromises = albumChunk.map(async (album) => {
         if (!album || !album.id || !album.name) {
           console.warn(`Invalid album data:`, album);
+          failedAlbums++;
           return;
         }
         
@@ -481,14 +652,19 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
             album, 
             artistRecord, 
             artistCache, 
-            processedTrackIds
+            processedTrackIds,
+            trackStats
           );
           
           if (tracks.length > 0) {
             processedTracks.push(...tracks);
           }
+          
+          successfulAlbums++;
         } catch (albumError) {
           console.error(`Error processing album ${album.id} (${album.name}):`, albumError);
+          failedAlbums++;
+          
           await supabase.rpc("log_error", {
             p_error_type: "processing",
             p_source: "process_artist",
@@ -498,6 +674,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
             p_item_id: spotifyId,
             p_item_type: "artist"
           });
+          
           // Continue with next album
         }
       });
@@ -507,6 +684,12 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       
       // Log progress after each chunk
       console.log(`Processed ${processedTrackIds.size} tracks so far (${i + 1}/${albumChunks.length} album chunks)`);
+      console.log(`Album processing stats: ${successfulAlbums} successful, ${failedAlbums} failed`);
+      
+      // Prevent long-running function timeouts by adding a small delay
+      if (i < albumChunks.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
     }
 
     // Update the artist's last_processed_at timestamp
@@ -517,8 +700,31 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       })
       .eq("spotify_id", spotifyId);
 
-    console.log(`Processed ${processedTrackIds.size} unique tracks for artist ${artistRecord.name} (based on Spotify ID)`);
-    console.log(`Stored ${processedTracks.length} tracks in the database`);
+    // Enhanced statistics reporting
+    console.log(`=== ARTIST PROCESSING STATS FOR ${artistRecord.name} ===`);
+    console.log(`Total unique tracks: ${processedTrackIds.size}`);
+    console.log(`Tracks stored in database: ${processedTracks.length}`);
+    console.log(`Albums processed: ${successfulAlbums} successful, ${failedAlbums} failed`);
+    console.log(`Tracks by album type: ${JSON.stringify(trackStats.byAlbumType, null, 2)}`);
+    console.log(`Total tracks seen: ${trackStats.total} (${trackStats.new} new, ${trackStats.duplicates} duplicates)`);
+    
+    // Verification stage - making a direct count query to verify database state
+    try {
+      const { count: dbTrackCount, error: countError } = await supabase
+        .from("tracks")
+        .select("*", { count: "exact", head: true })
+        .eq("artist_id", artistRecord.id);
+        
+      if (!countError) {
+        console.log(`Database verification: ${dbTrackCount} tracks for this artist in database`);
+        
+        if (dbTrackCount !== processedTracks.length) {
+          console.log(`Note: Database count (${dbTrackCount}) differs from tracks stored in this session (${processedTracks.length}). This may indicate tracks from previous runs.`);
+        }
+      }
+    } catch (verificationError) {
+      console.error(`Error verifying track count in database:`, verificationError);
+    }
 
     return {
       success: true,
@@ -528,7 +734,12 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
         artistId: artistRecord.id,
         tracksProcessed: processedTrackIds.size,
         tracksStored: processedTracks.length,
-        albumsProcessed: allAlbums.length,
+        albumsProcessed: {
+          total: allAlbums.length,
+          successful: successfulAlbums,
+          failed: failedAlbums
+        },
+        trackStats: trackStats,
         tracksDetails: processedTracks.slice(0, 10) // Return a sample to avoid overloading the response
       }
     };
