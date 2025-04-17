@@ -49,7 +49,7 @@ async function isApiRateLimited(apiName: string, endpoint: string): Promise<bool
 }
 
 // Create a new batch for processing tracks with validation
-async function createTracksBatch(limit: number = 50): Promise<string> {
+async function createTracksBatch(limit: number = 50, metadata?: Record<string, any>): Promise<string> {
   try {
     // Pre-flight check: Check if APIs are rate limited
     const spotifyLimited = await isApiRateLimited("spotify", "/tracks");
@@ -81,16 +81,19 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       console.log(`Using existing identify_producers batch ${batchId}`);
     } else {
       // Create a new batch
+      const batchMetadata = { 
+        limit,
+        created_by: "process-tracks-batch",
+        created_at: new Date().toISOString(),
+        ...metadata
+      };
+      
       const { data: newBatch, error: batchError } = await supabase
         .from("processing_batches")
         .insert({
           batch_type: "identify_producers",
           status: "pending",
-          metadata: { 
-            limit,
-            created_by: "process-tracks-batch",
-            created_at: new Date().toISOString()
-          }
+          metadata: batchMetadata
         })
         .select("id")
         .single();
@@ -104,28 +107,73 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       console.log(`Created new identify_producers batch ${batchId}`);
     }
     
-    // Exclude tracks that:
-    // 1. Already have producers
-    // 2. Are currently in a pending processing item
-    // 3. Have failed processing 5+ times
-    const subQuery = supabase
+    // FIX: Corrected query approach to avoid the "not.in.[object Object]" error
+    // First, get the IDs of tracks that are already in processing items
+    const { data: existingItemsData, error: existingItemsError } = await supabase
       .from("processing_items")
       .select("item_id")
       .eq("item_type", "track")
       .in("status", ["pending", "processing"])
       .or(`retry_count.gte.5,status.eq.error`);
-      
-    // Get tracks that don't have producers yet
-    const { data: tracks, error: tracksError } = await supabase
+    
+    if (existingItemsError) {
+      console.error("Error checking existing processing items:", existingItemsError);
+      throw existingItemsError;
+    }
+    
+    // Extract the item_ids into an array
+    const existingItemIds = existingItemsData?.map(item => item.item_id) || [];
+    
+    // Get the IDs of tracks that already have producers
+    const { data: trackProducersData, error: trackProducersError } = await supabase
+      .from("track_producers")
+      .select("track_id");
+    
+    if (trackProducersError) {
+      console.error("Error checking tracks with producers:", trackProducersError);
+      throw trackProducersError;
+    }
+    
+    // Extract track_ids into an array
+    const tracksWithProducers = trackProducersData?.map(item => item.track_id) || [];
+    
+    // Now build the query with explicit filters instead of subqueries
+    let query = supabase
       .from("tracks")
       .select("id, name, artist_id, popularity")
-      .not("id", "in", supabase.from("track_producers").select("track_id"))
-      .not("id", "in", subQuery)
-      .order("popularity", { ascending: false }) // Process popular tracks first
-      .limit(limit);
+      .order("popularity", { ascending: false });
+    
+    // Apply filtering only if arrays are non-empty
+    if (tracksWithProducers.length > 0) {
+      query = query.not('id', 'in', tracksWithProducers);
+    }
+    
+    if (existingItemIds.length > 0) {
+      query = query.not('id', 'in', existingItemIds);
+    }
+    
+    // Apply artist filter from metadata if provided
+    if (metadata?.artist_name) {
+      // Join with artists table to filter by artist name
+      const { data: artistData, error: artistError } = await supabase
+        .from("artists")
+        .select("id")
+        .ilike("name", metadata.artist_name)
+        .limit(1);
+      
+      if (!artistError && artistData && artistData.length > 0) {
+        query = query.eq('artist_id', artistData[0].id);
+      }
+    }
+    
+    // Apply the limit
+    query = query.limit(limit);
+    
+    // Execute the query
+    const { data: tracks, error: tracksError } = await query;
     
     if (tracksError) {
-      console.error("Error getting tracks without producers:", tracksError);
+      console.error("Error getting tracks:", tracksError);
       throw tracksError;
     }
     
@@ -500,11 +548,11 @@ serve(async (req) => {
     
     if (req.method === "POST") {
       // Parse request body
-      const { action, limit = 50 } = await req.json();
+      const { action, limit = 50, metadata } = await req.json();
       
       if (action === "create") {
         // Create a new batch
-        const batchId = await createTracksBatch(limit);
+        const batchId = await createTracksBatch(limit, metadata);
         
         result = {
           success: true,
