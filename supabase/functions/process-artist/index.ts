@@ -654,7 +654,7 @@ async function processAlbumTracks(
         const trackAlbumRecords = [];
         for (let k = 0; k < trackChunk.length; k++) {
           const track = trackChunk[k];
-          const insertedTrack = insertedTracks[k];
+          const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
           
           if (!track || !insertedTrack) {
             console.warn(`Missing data for track-album relationship at index ${k}`);
@@ -670,23 +670,38 @@ async function processAlbumTracks(
         }
         
         if (trackAlbumRecords.length > 0) {
-          const { error: insertTrackAlbumError } = await supabase
-            .from("track_albums")
-            .upsert(trackAlbumRecords, {
-              onConflict: 'track_id,album_id'
-            });
+          console.log(`Creating ${trackAlbumRecords.length} track-album relationships`);
+          
+          // Use a batch approach for inserting track-album records
+          const batchSize = 50;
+          const trackAlbumBatches = chunkArray(trackAlbumRecords, batchSize);
+          
+          for (const [batchIdx, batch] of trackAlbumBatches.entries()) {
+            console.log(`Processing track_albums batch ${batchIdx + 1}/${trackAlbumBatches.length}`);
             
-          if (insertTrackAlbumError) {
-            console.error(`Error creating track-album relationships:`, insertTrackAlbumError);
-          } else {
-            console.log(`Created ${trackAlbumRecords.length} track-album relationships for album "${album.name}"`);
+            const { error: insertTrackAlbumError } = await supabase
+              .from("track_albums")
+              .upsert(batch, {
+                onConflict: 'track_id,album_id'
+              });
+              
+            if (insertTrackAlbumError) {
+              console.error(`Error creating track-album relationships (batch ${batchIdx + 1}):`, insertTrackAlbumError);
+            } else {
+              console.log(`Created ${batch.length} track-album relationships for album "${album.name}" (batch ${batchIdx + 1})`);
+            }
+            
+            // Small delay between batches to avoid rate limits
+            if (batchIdx < trackAlbumBatches.length - 1) {
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
           }
         }
         
         // Now process all artist relationships for these tracks
         for (let k = 0; k < trackChunk.length; k++) {
           const track = trackChunk[k];
-          const insertedTrack = insertedTracks[k];
+          const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
           
           if (!track || !insertedTrack || !Array.isArray(track.artists)) {
             console.warn(`Missing data for track-artist relationship at index ${k}`);
@@ -942,11 +957,22 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
           console.log(`Note: Database count (${dbTrackCount}) differs from tracks stored in this session (${processedTracks.length}). This may indicate tracks from previous runs.`);
         }
       }
+      
+      // Add verification for track_albums table to confirm relationships are created
+      const { count: trackAlbumCount, error: trackAlbumError } = await supabase
+        .from("track_albums")
+        .select("*", { count: "exact", head: true })
+        .eq("album_id", "in", `(select id from albums where artist_id = '${artistRecord.id}')`);
+        
+      if (!trackAlbumError) {
+        console.log(`Track-album relationship verification: ${trackAlbumCount} relationships found for this artist's albums`);
+      }
     } catch (verificationError) {
-      console.error(`Error verifying track count in database:`, verificationError);
+      console.error(`Error verifying counts in database:`, verificationError);
     }
 
     // Prepare a reduced response to avoid response size limits
+    // IMPORTANT: Simplified to avoid JSON serialization issues
     const summaryData = {
       artist: artistRecord.name,
       artistId: artistRecord.id,
@@ -965,7 +991,6 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
         new: trackStats.new,
         duplicates: trackStats.duplicates
       }
-      // Do NOT include track details to avoid response size issues
     };
 
     return {
@@ -1064,7 +1089,14 @@ async function processBatch(batchId: string): Promise<{
                 status: "completed",
                 metadata: {
                   ...item.metadata,
-                  result
+                  result: {
+                    success: result.success,
+                    message: result.message,
+                    summary: {
+                      tracksProcessed: result.data?.tracksProcessed || 0,
+                      albumsProcessed: result.data?.albumsProcessed?.total || 0
+                    }
+                  }
                 }
               })
               .eq("id", item.id);
@@ -1143,8 +1175,8 @@ async function processBatch(batchId: string): Promise<{
       processed: processed.length,
       failed: failed.length,
       data: {
-        processedItems: processed,
-        failedItems: failed
+        processedItems: processed.length,
+        failedItems: failed.length
       }
     };
   } catch (error) {
@@ -1225,7 +1257,7 @@ serve(async (req) => {
       // Process all artists in a batch
       const result = await processBatch(batchId);
       
-      // Ensure response is properly formatted as JSON
+      // Ensure response is properly formatted as JSON with minimal data
       try {
         const safeResponse = {
           success: result.success,
@@ -1269,31 +1301,19 @@ serve(async (req) => {
       // Process a single artist (maintaining backward compatibility)
       const result = await processArtist(spotifyId);
       
-      // Ensure we return a valid JSON response with a reduced size
+      // Use a more minimal response to avoid JSON serialization issues
       try {
-        // Create a minimal response object to avoid serialization issues
+        // Create a minimal response object that's guaranteed to serialize properly
         const safeResponse = {
           success: result.success,
           message: result.message,
           data: result.data ? {
-            artist: result.data.artist,
-            artistId: result.data.artistId,
-            tracksProcessed: result.data.tracksProcessed,
-            tracksStored: result.data.tracksStored,
-            // Include only summary info for track stats, not the full objects
-            trackStats: {
-              primary: result.data.trackStats?.primary || 0,
-              features: result.data.trackStats?.features || 0,
-              total: result.data.trackStats?.total || 0,
-              new: result.data.trackStats?.new || 0,
-              duplicates: result.data.trackStats?.duplicates || 0,
-              byAlbumType: result.data.trackStats?.byAlbumType || {}
-            },
-            albumsProcessed: {
-              total: result.data.albumsProcessed?.total || 0,
-              successful: result.data.albumsProcessed?.successful || 0,
-              failed: result.data.albumsProcessed?.failed || 0
-            }
+            artist: result.data.artist || "",
+            tracksProcessed: result.data.tracksProcessed || 0,
+            tracksStored: result.data.tracksStored || 0,
+            primaryTracks: result.data.trackStats?.primary || 0,
+            featureTracks: result.data.trackStats?.features || 0,
+            albumsProcessed: result.data.albumsProcessed?.total || 0
           } : null
         };
         
