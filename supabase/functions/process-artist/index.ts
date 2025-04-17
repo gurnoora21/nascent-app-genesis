@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { RetryHelper, SpotifyClient, supabase } from "../lib/api-clients.ts";
 
@@ -508,7 +507,37 @@ async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Pro
 }
 
 /**
+ * Format partial release dates from Spotify to valid PostgreSQL date format
+ * Handles cases where Spotify returns only year or year-month
+ */
+function formatReleaseDate(releaseDate: string | null): string | null {
+  if (!releaseDate) return null;
+  
+  // Check release date format - Spotify uses three different precisions:
+  // year: "2012", year-month: "2012-03", full-date: "2012-03-25"
+  const dateParts = releaseDate.split('-');
+  
+  if (dateParts.length === 1 && dateParts[0].length === 4) {
+    // Year only format (e.g., "2012") - append "-01-01" to make it January 1st
+    console.log(`Converting year-only date "${releaseDate}" to "${releaseDate}-01-01"`);
+    return `${releaseDate}-01-01`;
+  } else if (dateParts.length === 2) {
+    // Year-month format (e.g., "2012-03") - append "-01" to make it the 1st day of the month
+    console.log(`Converting year-month date "${releaseDate}" to "${releaseDate}-01"`);
+    return `${releaseDate}-01`;
+  } else if (dateParts.length === 3) {
+    // Already full date format, return as is
+    return releaseDate;
+  } else {
+    // Unknown format, log it and return null
+    console.error(`Unknown release date format: ${releaseDate}`);
+    return null;
+  }
+}
+
+/**
  * Create or get album record with the new database structure
+ * Now includes handling for partial release dates
  */
 async function getOrCreateAlbum(album: any, artistRecord: any): Promise<any> {
   try {
@@ -529,13 +558,16 @@ async function getOrCreateAlbum(album: any, artistRecord: any): Promise<any> {
     if (checkError.code === "PGRST116") { // Not found
       console.log(`Album ${album.name} not found, inserting new record`);
       
+      // Format the release date properly to handle Spotify's various date formats
+      const formattedReleaseDate = formatReleaseDate(album.release_date);
+      
       // Insert the album into our database
       const { data: insertedAlbum, error: insertError } = await supabase
         .from("albums")
         .insert({
           name: album.name,
           spotify_id: album.id,
-          release_date: album.release_date,
+          release_date: formattedReleaseDate, // Use the formatted date
           album_type: album.album_type,
           total_tracks: album.total_tracks,
           image_url: album.images?.[0]?.url,
