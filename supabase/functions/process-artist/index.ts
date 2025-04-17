@@ -22,6 +22,8 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       .eq("spotify_id", spotifyId)
       .single();
 
+    let artistRecord;
+    
     if (checkError) {
       console.error(`Error checking for existing artist ${spotifyId}:`, checkError);
       if (checkError.code === "PGRST116") { // Not found
@@ -29,7 +31,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
         const artistData = await spotify.getArtist(spotifyId);
         
         // Insert the artist into our database
-        const { data: artistRecord, error: insertError } = await supabase
+        const { data: insertedArtist, error: insertError } = await supabase
           .from("artists")
           .insert({
             name: artistData.name,
@@ -52,37 +54,37 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
           throw new Error(`Failed to insert artist: ${insertError.message}`);
         }
         
+        artistRecord = insertedArtist;
         console.log(`Inserted new artist: ${artistData.name}`);
       } else {
         throw new Error(`Failed to check for existing artist: ${checkError.message}`);
       }
     } else {
+      artistRecord = existingArtist;
       console.log(`Artist ${existingArtist.name} already exists in the database`);
     }
 
-    // Get artist ID from the database
-    const { data: artistRecord, error: artistError } = await supabase
-      .from("artists")
-      .select("id")
-      .eq("spotify_id", spotifyId)
-      .single();
+    // Cache for artists we encounter to avoid duplicate lookups
+    const artistCache = new Map<string, string>();
+    artistCache.set(spotifyId, artistRecord.id);
 
-    if (artistError) {
-      throw new Error(`Failed to get artist ID: ${artistError.message}`);
-    }
-
-    // Get all artist albums from Spotify using chunking approach
+    // Get all artist albums from Spotify using chunking approach and ALL include_groups
     let allAlbums = [];
     let offset = 0;
     const limit = 20; // Smaller chunks for better stability
     let hasMore = true;
     let totalAlbums = 0;
 
-    console.log(`Fetching albums for artist ${spotifyId} in chunks of ${limit}`);
+    console.log(`Fetching albums for artist ${spotifyId} in chunks of ${limit} (including appears_on and compilations)`);
     
     while (hasMore) {
       try {
-        const albumsResponse = await spotify.getArtistAlbums(spotifyId, limit, offset);
+        const albumsResponse = await spotify.getArtistAlbums(
+          spotifyId, 
+          limit, 
+          offset, 
+          "album,single,compilation,appears_on" // Include ALL album groups
+        );
         
         if (!albumsResponse?.items || albumsResponse.items.length === 0) {
           hasMore = false;
@@ -122,28 +124,10 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
 
     console.log(`Found ${allAlbums.length} albums for artist`);
     
-    // Track deduplication map to avoid adding the same track multiple times
-    // Key is trackName-durationInSeconds to account for similar tracks with same name but different length
-    const processedTracksMap = new Map();
+    // Track deduplication map using Spotify IDs
+    const processedTrackIds = new Set<string>();
     const processedTracks = [];
     
-    // Check existing tracks for this artist to avoid reprocessing
-    const { data: existingTracks, error: existingTracksError } = await supabase
-      .from("tracks")
-      .select("name, metadata, spotify_id")
-      .eq("artist_id", artistRecord.id);
-    
-    if (!existingTracksError && existingTracks) {
-      // Add existing tracks to our deduplication map
-      existingTracks.forEach(track => {
-        const duration = track.metadata?.duration_ms ? Math.floor(track.metadata.duration_ms / 1000) : 0;
-        const dedupeKey = `${track.name.toLowerCase()}-${duration}`;
-        processedTracksMap.set(dedupeKey, track.spotify_id);
-      });
-      
-      console.log(`Found ${existingTracks.length} existing tracks to avoid duplication`);
-    }
-
     // Process albums in smaller chunks to avoid timeouts
     const albumChunkSize = 5;
     for (let i = 0; i < allAlbums.length; i += albumChunkSize) {
@@ -157,6 +141,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
           let trackOffset = 0;
           const trackLimit = 20; // Smaller chunks
           let hasMoreTracks = true;
+          let albumTracks = [];
           
           while (hasMoreTracks) {
             try {
@@ -167,71 +152,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
                 break;
               }
               
-              // Process each track with deduplication
-              for (const track of tracksResponse.items) {
-                try {
-                  // Create a deduplication key based on track name and duration
-                  const duration = track.duration_ms ? Math.floor(track.duration_ms / 1000) : 0;
-                  const dedupeKey = `${track.name.toLowerCase()}-${duration}`;
-                  
-                  // Skip if we already processed this track (either in this run or found in DB)
-                  if (processedTracksMap.has(dedupeKey)) {
-                    continue;
-                  }
-                  
-                  // Mark as processed to avoid duplicates
-                  processedTracksMap.set(dedupeKey, track.id);
-                  
-                  // Insert track
-                  const { data: trackRecord, error: insertTrackError } = await supabase
-                    .from("tracks")
-                    .insert({
-                      name: track.name,
-                      spotify_id: track.id,
-                      artist_id: artistRecord.id,
-                      album_name: album.name,
-                      release_date: album.release_date,
-                      spotify_url: track.external_urls?.spotify,
-                      preview_url: track.preview_url,
-                      metadata: {
-                        disc_number: track.disc_number,
-                        duration_ms: track.duration_ms,
-                        explicit: track.explicit,
-                        external_urls: track.external_urls,
-                        album: {
-                          id: album.id,
-                          name: album.name,
-                          type: album.album_type,
-                          total_tracks: album.total_tracks
-                        }
-                      }
-                    })
-                    .select("id")
-                    .single();
-
-                  if (insertTrackError) {
-                    console.error(`Error inserting track ${track.id}:`, insertTrackError);
-                    continue;
-                  }
-                  
-                  processedTracks.push({
-                    id: trackRecord.id,
-                    spotify_id: track.id,
-                    name: track.name
-                  });
-                } catch (trackError) {
-                  console.error(`Error processing track ${track.id}:`, trackError);
-                  await supabase.rpc("log_error", {
-                    p_error_type: "processing",
-                    p_source: "process_artist",
-                    p_message: `Error processing track`,
-                    p_stack_trace: trackError.stack || "",
-                    p_context: { trackId: track.id, albumId: album.id },
-                    p_item_id: spotifyId,
-                    p_item_type: "artist"
-                  });
-                }
-              }
+              albumTracks.push(...tracksResponse.items);
               
               trackOffset += trackLimit;
               hasMoreTracks = tracksResponse.items.length === trackLimit && tracksResponse.next;
@@ -249,6 +170,143 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
               
               // Break but continue with next album
               break;
+            }
+          }
+          
+          console.log(`Album "${album.name}" has ${albumTracks.length} tracks`);
+          
+          // Filter out tracks we've already processed
+          const newTracks = albumTracks.filter(track => !processedTrackIds.has(track.id));
+          
+          if (newTracks.length === 0) {
+            console.log(`No new tracks to process in album "${album.name}"`);
+            return;
+          }
+          
+          // Mark these tracks as processed
+          newTracks.forEach(track => processedTrackIds.add(track.id));
+          
+          // Process tracks in smaller batches
+          const trackChunkSize = 50;
+          for (let j = 0; j < newTracks.length; j += trackChunkSize) {
+            const trackChunk = newTracks.slice(j, j + trackChunkSize);
+            
+            // Create the track records for insertion
+            const trackRecords = trackChunk.map(track => ({
+              name: track.name,
+              spotify_id: track.id,
+              artist_id: artistRecord.id, // Primary artist is the one we're processing
+              album_name: album.name,
+              release_date: album.release_date,
+              spotify_url: track.external_urls?.spotify,
+              preview_url: track.preview_url,
+              metadata: {
+                disc_number: track.disc_number,
+                track_number: track.track_number,
+                duration_ms: track.duration_ms,
+                explicit: track.explicit,
+                external_urls: track.external_urls,
+                album: {
+                  id: album.id,
+                  name: album.name,
+                  type: album.album_type,
+                  total_tracks: album.total_tracks,
+                  release_date: album.release_date,
+                  release_date_precision: album.release_date_precision
+                }
+              }
+            }));
+            
+            // Insert tracks with ON CONFLICT DO UPDATE
+            const { data: insertedTracks, error: insertTracksError } = await supabase
+              .from("tracks")
+              .upsert(trackRecords, {
+                onConflict: 'spotify_id',
+                returning: 'id,spotify_id,name'
+              });
+
+            if (insertTracksError) {
+              console.error(`Error upserting tracks:`, insertTracksError);
+              continue;
+            }
+            
+            console.log(`Upserted ${insertedTracks.length} tracks from album "${album.name}"`);
+            processedTracks.push(...insertedTracks);
+            
+            // Now process all artist relationships for these tracks
+            for (let k = 0; k < trackChunk.length; k++) {
+              const track = trackChunk[k];
+              const insertedTrack = insertedTracks[k];
+              
+              if (!insertedTrack) continue;
+              
+              // Process each artist on the track
+              for (const [index, trackArtist] of track.artists.entries()) {
+                let dbArtistId;
+                
+                // Check if we've already seen this artist
+                if (artistCache.has(trackArtist.id)) {
+                  dbArtistId = artistCache.get(trackArtist.id);
+                } else {
+                  // Try to get the artist from the database
+                  const { data: existingTrackArtist, error: artistError } = await supabase
+                    .from("artists")
+                    .select("id")
+                    .eq("spotify_id", trackArtist.id)
+                    .single();
+                  
+                  if (artistError && artistError.code === "PGRST116") {
+                    // Artist doesn't exist, so insert it with basic information
+                    const { data: newArtist, error: insertArtistError } = await supabase
+                      .from("artists")
+                      .insert({
+                        name: trackArtist.name,
+                        spotify_id: trackArtist.id,
+                        spotify_url: trackArtist.external_urls?.spotify,
+                        metadata: {
+                          external_urls: trackArtist.external_urls,
+                          needs_full_processing: true // Flag to fully process this artist later
+                        }
+                      })
+                      .select("id")
+                      .single();
+                    
+                    if (insertArtistError) {
+                      console.error(`Error inserting artist ${trackArtist.id}:`, insertArtistError);
+                      continue;
+                    }
+                    
+                    dbArtistId = newArtist.id;
+                  } else if (artistError) {
+                    console.error(`Error checking for artist ${trackArtist.id}:`, artistError);
+                    continue;
+                  } else {
+                    dbArtistId = existingTrackArtist.id;
+                  }
+                  
+                  // Cache the artist ID
+                  artistCache.set(trackArtist.id, dbArtistId);
+                }
+                
+                // Create the track-artist relationship
+                // Is primary if it's our main artist or it's the first artist listed
+                const isPrimary = trackArtist.id === spotifyId || index === 0;
+                const { error: relationshipError } = await supabase
+                  .from("track_artists")
+                  .upsert({
+                    track_id: insertedTrack.id,
+                    artist_id: dbArtistId,
+                    is_primary: isPrimary
+                  }, {
+                    onConflict: 'track_id,artist_id'
+                  });
+                
+                if (relationshipError) {
+                  console.error(`Error creating track-artist relationship:`, relationshipError);
+                } else {
+                  console.log(`Created track-artist relationship for "${track.name}" and "${trackArtist.name}"`);
+                }
+              }
             }
           }
         } catch (albumError) {
@@ -278,15 +336,14 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       })
       .eq("spotify_id", spotifyId);
 
-    const dedupeCount = processedTracksMap.size - processedTracks.length;
-    console.log(`Processed ${processedTracks.length} unique tracks for artist (deduplicated ${dedupeCount} tracks)`);
+    console.log(`Processed ${processedTrackIds.size} unique tracks for artist (based on Spotify ID)`);
 
     return {
       success: true,
-      message: `Successfully processed artist with ${processedTracks.length} unique tracks`,
+      message: `Successfully processed artist with ${processedTrackIds.size} unique tracks`,
       data: {
-        tracksProcessed: processedTracks.length,
-        duplicatesSkipped: dedupeCount
+        tracksProcessed: processedTrackIds.size,
+        tracksDetails: processedTracks.slice(0, 10) // Return a sample to avoid overloading the response
       }
     };
   } catch (error) {

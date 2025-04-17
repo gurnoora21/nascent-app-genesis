@@ -263,6 +263,48 @@ export type Database = {
         }
         Relationships: []
       }
+      track_artists: {
+        Row: {
+          artist_id: string
+          created_at: string
+          id: string
+          is_primary: boolean
+          track_id: string
+          updated_at: string
+        }
+        Insert: {
+          artist_id: string
+          created_at?: string
+          id?: string
+          is_primary?: boolean
+          track_id: string
+          updated_at?: string
+        }
+        Update: {
+          artist_id?: string
+          created_at?: string
+          id?: string
+          is_primary?: boolean
+          track_id?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "track_artists_artist_id_fkey"
+            columns: ["artist_id"]
+            isOneToOne: false
+            referencedRelation: "artists"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "track_artists_track_id_fkey"
+            columns: ["track_id"]
+            isOneToOne: false
+            referencedRelation: "tracks"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       track_producers: {
         Row: {
           confidence: Database["public"]["Enums"]["confidence_level"]

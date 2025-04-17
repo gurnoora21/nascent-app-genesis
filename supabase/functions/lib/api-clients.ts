@@ -1,4 +1,3 @@
-
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 const SUPABASE_URL = "https://nsxxzhhbcwzatvlulfyp.supabase.co";
@@ -246,9 +245,14 @@ export class SpotifyClient {
   }
 
   // Get artist's albums
-  async getArtistAlbums(id: string, limit = 50, offset = 0): Promise<any> {
+  async getArtistAlbums(
+    id: string, 
+    limit = 50, 
+    offset = 0,
+    include_groups = "album,single,compilation,appears_on"
+  ): Promise<any> {
     return this.makeRequest(
-      `/artists/${id}/albums?limit=${limit}&offset=${offset}&include_groups=album,single`
+      `/artists/${id}/albums?limit=${limit}&offset=${offset}&include_groups=${encodeURIComponent(include_groups)}`
     );
   }
 
