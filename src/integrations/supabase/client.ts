@@ -10,3 +10,25 @@ const SUPABASE_PUBLISHABLE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiO
 // import { supabase } from "@/integrations/supabase/client";
 
 export const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
+
+// Format function for Spotify release dates
+export function formatSpotifyReleaseDate(releaseDate: string | null): string | null {
+  if (!releaseDate) return null;
+  
+  const dateParts = releaseDate.split('-');
+  
+  if (dateParts.length === 1 && dateParts[0].length === 4) {
+    // Year only format (e.g., "2012") - append "-01-01" to make it January 1st
+    return `${releaseDate}-01-01`;
+  } else if (dateParts.length === 2) {
+    // Year-month format (e.g., "2012-03") - append "-01" to make it the 1st day of the month
+    return `${releaseDate}-01`;
+  } else if (dateParts.length === 3) {
+    // Already full date format, return as is
+    return releaseDate;
+  } else {
+    // Unknown format, log it and return null
+    console.error(`Unknown release date format: ${releaseDate}`);
+    return null;
+  }
+}
