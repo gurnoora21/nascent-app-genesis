@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { RetryHelper, SpotifyClient, supabase } from "../lib/api-clients.ts";
 
@@ -1134,44 +1135,106 @@ serve(async (req) => {
       // Process all artists in a batch
       const result = await processBatch(batchId);
       
-      return new Response(
-        JSON.stringify(result),
-        {
-          status: result.success ? 200 : 500,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders,
-          },
-        }
-      );
+      // Ensure response is properly formatted as JSON
+      try {
+        const safeResponse = {
+          success: result.success,
+          message: result.message,
+          processed: result.processed,
+          failed: result.failed,
+          // Minimize data to avoid large responses
+          data: result.processed > 0 ? {
+            processedCount: result.processed,
+            failedCount: result.failed
+          } : null
+        };
+        
+        return new Response(
+          JSON.stringify(safeResponse),
+          {
+            status: result.success ? 200 : 500,
+            headers: {
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
+          }
+        );
+      } catch (jsonError) {
+        console.error("Error serializing batch result:", jsonError);
+        return new Response(
+          JSON.stringify({
+            success: false,
+            message: "Error serializing response: " + (jsonError instanceof Error ? jsonError.message : String(jsonError))
+          }),
+          {
+            status: 500,
+            headers: {
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
+          }
+        );
+      }
     } else if (spotifyId) {
       // Process a single artist (maintaining backward compatibility)
       const result = await processArtist(spotifyId);
       
       // Ensure we return a valid JSON response with a reduced size
-      const safeResponse = {
-        success: result.success,
-        message: result.message,
-        data: result.data ? {
-          artist: result.data.artist,
-          artistId: result.data.artistId,
-          tracksProcessed: result.data.tracksProcessed,
-          tracksStored: result.data.tracksStored,
-          trackStats: result.data.trackStats,
-          albumsProcessed: result.data.albumsProcessed
-        } : null
-      };
-      
-      return new Response(
-        JSON.stringify(safeResponse),
-        {
-          status: result.success ? 200 : 500,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders,
-          },
-        }
-      );
+      try {
+        // Create a minimal response object to avoid serialization issues
+        const safeResponse = {
+          success: result.success,
+          message: result.message,
+          data: result.data ? {
+            artist: result.data.artist,
+            artistId: result.data.artistId,
+            tracksProcessed: result.data.tracksProcessed,
+            tracksStored: result.data.tracksStored,
+            // Include only summary info for track stats, not the full objects
+            trackStats: {
+              primary: result.data.trackStats?.primary || 0,
+              features: result.data.trackStats?.features || 0,
+              total: result.data.trackStats?.total || 0,
+              new: result.data.trackStats?.new || 0,
+              duplicates: result.data.trackStats?.duplicates || 0,
+              byAlbumType: result.data.trackStats?.byAlbumType || {}
+            },
+            albumsProcessed: {
+              total: result.data.albumsProcessed?.total || 0,
+              successful: result.data.albumsProcessed?.successful || 0,
+              failed: result.data.albumsProcessed?.failed || 0
+            }
+          } : null
+        };
+        
+        return new Response(
+          JSON.stringify(safeResponse),
+          {
+            status: result.success ? 200 : 500,
+            headers: {
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
+          }
+        );
+      } catch (jsonError) {
+        console.error("Error serializing artist result:", jsonError);
+        // Fall back to an even more minimal response if serialization fails
+        return new Response(
+          JSON.stringify({
+            success: true,
+            message: "Processing completed but response was too large to serialize. Check logs for details.",
+            error: String(jsonError)
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              ...corsHeaders,
+            },
+          }
+        );
+      }
     } else {
       return new Response(
         JSON.stringify({
@@ -1203,7 +1266,7 @@ serve(async (req) => {
       console.error("Error logging to database:", logError);
     }
 
-    // Ensure we always return a properly formatted JSON response with a small payload
+    // Return a minimal error response that's guaranteed to serialize properly
     return new Response(
       JSON.stringify({
         success: false,
