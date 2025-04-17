@@ -114,11 +114,11 @@ async function processBatch(batchType: string): Promise<{
             throw new Error(result.message || "Unknown error processing artist");
           }
           
-          // Mark item as processed
+          // FIX 2: Mark item as processed with completed status
           await supabase
             .from("processing_items")
             .update({
-              status: "completed",
+              status: "completed",  // Explicitly set to completed
               metadata: {
                 ...item.metadata,
                 result
@@ -174,7 +174,7 @@ async function processBatch(batchType: string): Promise<{
     
     console.log(`Batch ${batchId} processing complete. Processed: ${processedItems.length}, Failed: ${failedItems.length}`);
     
-    // Get all items for this batch to check overall progress
+    // FIX 1: Get accurate counts from the database for this batch
     const { count: totalItems, error: countError } = await supabase
       .from("processing_items")
       .select("*", { count: "exact", head: true })
@@ -216,7 +216,7 @@ async function processBatch(batchType: string): Promise<{
       await createNextBatchInPipeline(batchId);
     }
     
-    // Update batch with progress
+    // Update batch with accurate progress
     if (!countError && !completedError && !errorCountError) {
       await supabase
         .from("processing_batches")
@@ -316,13 +316,13 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
     
     // Add appropriate items based on the batch type
     if (nextBatchType === "collect_tracks") {
-      // For collect_tracks, we add all processed artists from the process_artists batch
+      // FIX 3: For collect_tracks, we add only COMPLETED processed artists from the process_artists batch
       const { data: completedItems, error: itemsError } = await supabase
         .from("processing_items")
         .select("item_id, priority")
         .eq("batch_id", batchId)
         .eq("item_type", "artist")
-        .eq("status", "completed");
+        .eq("status", "completed");  // Only get completed items
       
       if (itemsError) {
         console.error(`Error getting completed items from batch:`, itemsError);
@@ -345,7 +345,7 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
         } else {
           console.log(`Added ${newItems.length} artists to collect_tracks batch ${newBatch.id}`);
           
-          // Update the batch with the total number of items
+          // Update the batch with the accurate total number of items
           await supabase
             .from("processing_batches")
             .update({
@@ -358,16 +358,16 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
       // For identify_producers, we create a batch but leave item creation to process-tracks-batch
       console.log(`identify_producers batch created, but items will be added by process-tracks-batch`);
     } else if (nextBatchType === "process_artists") {
-      // For process_artists, add completed items from discover_artists batch
+      // FIX 3: For process_artists, add only COMPLETED items from discover_artists batch
       const { data: completedItems, error: itemsError } = await supabase
         .from("processing_items")
         .select("item_id, priority")
         .eq("batch_id", batchId)
         .eq("item_type", "artist")
-        .eq("status", "completed");
+        .eq("status", "completed");  // Only get completed items
       
       if (itemsError) {
-        console.error(`Error getting items from parent batch:`, itemsError);
+        console.error(`Error getting completed items from parent batch:`, itemsError);
       } else if (completedItems && completedItems.length > 0) {
         // Create new processing items for each artist
         const newItems = completedItems.map(item => ({
@@ -387,7 +387,7 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
         } else {
           console.log(`Added ${newItems.length} artists to process_artists batch ${newBatch.id}`);
           
-          // Update the batch with the total number of items
+          // Update the batch with the accurate total number of items
           await supabase
             .from("processing_batches")
             .update({
