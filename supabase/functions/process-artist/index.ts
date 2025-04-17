@@ -447,66 +447,6 @@ async function fetchAlbumTracks(spotify: SpotifyClient, albumId: string): Promis
 }
 
 /**
- * Create or get artist record
- */
-async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Promise<any> {
-  try {
-    // First check if artist exists in our database
-    const { data: existingArtist, error: checkError } = await supabase
-      .from("artists")
-      .select("*")
-      .eq("spotify_id", spotifyId)
-      .single();
-
-    if (!checkError) {
-      console.log(`Artist ${existingArtist.name} already exists in the database`);
-      return existingArtist;
-    }
-
-    if (checkError.code === "PGRST116") { // Not found
-      // Get artist details from Spotify
-      const artistData = await spotify.getArtist(spotifyId);
-      
-      if (!artistData || !artistData.id) {
-        throw new Error(`Failed to fetch artist data from Spotify for ID: ${spotifyId}`);
-      }
-      
-      // Insert the artist into our database
-      const { data: insertedArtist, error: insertError } = await supabase
-        .from("artists")
-        .insert({
-          name: artistData.name,
-          spotify_id: artistData.id,
-          genres: artistData.genres || [],
-          popularity: artistData.popularity,
-          spotify_url: artistData.external_urls?.spotify,
-          image_url: artistData.images?.[0]?.url,
-          metadata: {
-            followers: artistData.followers,
-            images: artistData.images,
-            external_urls: artistData.external_urls,
-          },
-          last_processed_at: new Date().toISOString(),
-        })
-        .select("*")
-        .single();
-
-      if (insertError) {
-        throw new Error(`Failed to insert artist: ${insertError.message}`);
-      }
-      
-      console.log(`Inserted new artist: ${artistData.name}`);
-      return insertedArtist;
-    } else {
-      throw new Error(`Failed to check for existing artist: ${checkError.message}`);
-    }
-  } catch (error) {
-    console.error(`Error in getOrCreateArtist for ${spotifyId}:`, error);
-    throw error;
-  }
-}
-
-/**
  * Format partial release dates from Spotify to valid PostgreSQL date format
  * Handles cases where Spotify returns only year or year-month
  */
@@ -607,344 +547,256 @@ async function getOrCreateAlbum(album: any, artistRecord: any): Promise<any> {
 }
 
 /**
- * Enhanced process tracks from an album function with better handling of featured artists
- * Now updated to work with the new database schema
+ * Process a single album with its tracks atomically
+ * This isolates the processing of each album to avoid issues with long-running operations
  */
-async function processAlbumTracks(
-  spotify: SpotifyClient, 
-  album: any, 
-  albumRecord: any,
-  artistRecord: any, 
+async function processAlbumWithTracks(
+  spotify: SpotifyClient,
+  albumData: any,
+  artistRecord: any,
   artistCache: Map<string, string>,
-  processedTrackIds: Set<string>,
-  trackStats: {
-    total: number;
-    new: number;
-    duplicates: number;
-    primary: number;
-    features: number;
-    byAlbumType: Record<string, number>;
-  }
-): Promise<any[]> {
-  const processedTracks = [];
-  
+  processedTrackIds: Set<string> = new Set()
+): Promise<{
+  success: boolean;
+  tracksProcessed: number;
+  message?: string;
+  error?: any;
+}> {
   try {
-    console.log(`Processing tracks for album "${album.name}" (ID: ${album.id}, Type: ${album.album_type}, Database ID: ${albumRecord.id})`);
+    console.log(`Processing album "${albumData.name}" (ID: ${albumData.id})`);
+    
+    // Store the album in database
+    const albumRecord = await getOrCreateAlbum(albumData, artistRecord);
     
     // Get all tracks for this album
-    const albumTracks = await fetchAlbumTracks(spotify, album.id);
+    const albumTracks = await fetchAlbumTracks(spotify, albumData.id);
     
     if (albumTracks.length === 0) {
-      console.log(`No tracks found for album "${album.name}"`);
-      return [];
+      console.log(`No tracks found for album "${albumData.name}"`);
+      return { success: true, tracksProcessed: 0 };
     }
     
-    // Enhanced duplicate detection logging
-    const newTracks = [];
-    const duplicateTracks = [];
+    // Filter tracks to only include new ones we haven't processed yet
+    const newTracks = albumTracks.filter(track => !processedTrackIds.has(track.id));
+    console.log(`Found ${newTracks.length} new tracks and ${albumTracks.length - newTracks.length} duplicates in album "${albumData.name}"`);
     
-    // Filter out tracks we've already processed with better logging
-    for (const track of albumTracks) {
-      if (!track || !track.id) {
-        console.warn(`Invalid track data in album ${album.name}`);
-        continue;
-      }
-      
-      // IMPORTANT: Only process tracks where the artist is involved
-      // This is the key change to only get tracks featuring the artist on other albums
-      const artistInvolved = track.artists && Array.isArray(track.artists) && 
-                            track.artists.some(artist => artist.id === artistRecord.spotify_id);
-      
-      // Skip tracks that don't involve our artist if this is not the artist's primary album
-      if (!album.is_primary_artist_album && !artistInvolved) {
-        console.log(`Skipping track "${track.name}" from album "${album.name}" - artist not involved`);
-        continue;
-      }
-      
-      if (processedTrackIds.has(track.id)) {
-        duplicateTracks.push(track);
-      } else {
-        newTracks.push(track);
+    // Mark all tracks as processed regardless of whether we actually insert them
+    // This prevents duplicate processing
+    albumTracks.forEach(track => {
+      if (track && track.id) {
         processedTrackIds.add(track.id);
       }
+    });
+    
+    // If this is not the artist's primary album, only include tracks where the artist appears
+    const relevantTracks = albumData.is_primary_artist_album ? 
+      newTracks : 
+      newTracks.filter(track => {
+        return track.artists && 
+               Array.isArray(track.artists) && 
+               track.artists.some(artist => artist.id === artistRecord.spotify_id);
+      });
+      
+    if (relevantTracks.length === 0) {
+      console.log(`No relevant tracks in album "${albumData.name}"`);
+      return { success: true, tracksProcessed: 0 };
     }
     
-    // Update statistics
-    trackStats.total += albumTracks.length;
-    trackStats.new += newTracks.length;
-    trackStats.duplicates += duplicateTracks.length;
-    
-    // Track by album type
-    const albumType = album.album_type || 'unknown';
-    trackStats.byAlbumType[albumType] = (trackStats.byAlbumType[albumType] || 0) + newTracks.length;
-    
-    console.log(`Found ${newTracks.length} new tracks and ${duplicateTracks.length} duplicates in album "${album.name}"`);
-    
-    if (newTracks.length === 0) {
-      console.log(`No new tracks to process in album "${album.name}"`);
-      return [];
-    }
+    console.log(`Processing ${relevantTracks.length} relevant tracks for album "${albumData.name}"`);
     
     // Process tracks in smaller batches
-    const trackChunks = chunkArray(newTracks, 20);
+    const trackChunks = chunkArray(relevantTracks, 20);
+    let totalProcessed = 0;
     
     for (const [chunkIndex, trackChunk] of trackChunks.entries()) {
-      console.log(`Processing track chunk ${chunkIndex + 1}/${trackChunks.length} for album "${album.name}"`);
+      console.log(`Processing track chunk ${chunkIndex + 1}/${trackChunks.length} for album "${albumData.name}"`);
       
-      try {
-        // Create the track records for insertion
-        const trackRecords = trackChunk.map(track => {
-          if (!track || !track.id) {
-            console.warn(`Invalid track data in album ${album.name}:`, track);
-            return null;
-          }
-          
-          return {
-            name: track.name,
-            spotify_id: track.id,
-            artist_id: artistRecord.id, // Primary artist is the one we're processing
-            spotify_url: track.external_urls?.spotify,
-            preview_url: track.preview_url,
-            release_date: album.release_date,
-            metadata: {
-              disc_number: track.disc_number,
-              track_number: track.track_number,
-              duration_ms: track.duration_ms,
-              explicit: track.explicit,
-              external_urls: track.external_urls
-            }
-          };
-        }).filter(record => record !== null); // Filter out any null records
-        
-        if (trackRecords.length === 0) {
-          console.warn(`No valid track records to insert for chunk in album "${album.name}"`);
+      // Create track records and collect their IDs for batch association
+      const trackRecordsToInsert = [];
+      
+      for (const track of trackChunk) {
+        if (!track || !track.id) {
+          console.warn(`Invalid track data in album ${albumData.name}`);
           continue;
         }
         
-        // Insert tracks with ON CONFLICT DO UPDATE
-        const { data: insertedTracks, error: insertTracksError } = await supabase
-          .from("tracks")
-          .upsert(trackRecords, {
-            onConflict: 'spotify_id',
-            returning: 'id,spotify_id,name'
-          });
+        trackRecordsToInsert.push({
+          name: track.name,
+          spotify_id: track.id,
+          artist_id: artistRecord.id,
+          spotify_url: track.external_urls?.spotify,
+          preview_url: track.preview_url,
+          release_date: albumData.release_date,
+          metadata: {
+            disc_number: track.disc_number,
+            track_number: track.track_number,
+            duration_ms: track.duration_ms,
+            explicit: track.explicit,
+            external_urls: track.external_urls
+          }
+        });
+      }
+      
+      if (trackRecordsToInsert.length === 0) {
+        console.warn(`No valid track records to insert for chunk in album "${albumData.name}"`);
+        continue;
+      }
+      
+      // Insert tracks with ON CONFLICT DO UPDATE
+      const { data: insertedTracks, error: insertTracksError } = await supabase
+        .from("tracks")
+        .upsert(trackRecordsToInsert, {
+          onConflict: 'spotify_id',
+          returning: 'id,spotify_id,name'
+        });
 
-        if (insertTracksError) {
-          console.error(`Error upserting tracks:`, insertTracksError);
+      if (insertTracksError) {
+        console.error(`Error upserting tracks:`, insertTracksError);
+        throw insertTracksError;
+      }
+      
+      if (!insertedTracks || insertedTracks.length === 0) {
+        console.warn(`No tracks were inserted/updated for chunk in album "${albumData.name}"`);
+        continue;
+      }
+      
+      console.log(`Upserted ${insertedTracks.length} tracks from album "${albumData.name}"`);
+      
+      // Create track-album relationships
+      console.log(`Creating track-album relationships for album ID: ${albumRecord.id}`);
+      
+      // Prepare track-album relationships for batch insertion
+      const trackAlbumRecords = [];
+      
+      for (let i = 0; i < trackChunk.length; i++) {
+        const track = trackChunk[i];
+        // Find the corresponding inserted track
+        const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
+        
+        if (!insertedTrack || !insertedTrack.id) {
+          console.warn(`Could not find inserted track record for Spotify ID: ${track.id}`);
           continue;
         }
         
-        if (!insertedTracks || insertedTracks.length === 0) {
-          console.warn(`No tracks were inserted/updated for chunk in album "${album.name}"`);
-          continue;
-        }
+        trackAlbumRecords.push({
+          track_id: insertedTrack.id,
+          album_id: albumRecord.id,
+          track_number: track.track_number || null,
+          disc_number: track.disc_number || null
+        });
         
-        console.log(`Upserted ${insertedTracks.length} tracks from album "${album.name}"`);
-        processedTracks.push(...insertedTracks);
+        console.log(`Prepared track-album relationship: Track "${track.name}" -> Album "${albumData.name}"`);
+      }
+      
+      if (trackAlbumRecords.length === 0) {
+        console.warn(`No track-album relationships to create for album "${albumData.name}"`);
+        continue;
+      }
+      
+      // Insert track-album relationships in smaller batches
+      const relationshipBatches = chunkArray(trackAlbumRecords, 25);
+      
+      for (const [batchIndex, relationshipBatch] of relationshipBatches.entries()) {
+        console.log(`Inserting batch ${batchIndex + 1}/${relationshipBatches.length} of track-album relationships`);
         
-        // Now create track-album relationships - FIXED SECTION
-        console.log(`Creating track-album relationships for album ID: ${albumRecord.id}`);
-        
-        // Store track_album relationships that need to be created
-        const trackAlbumRecords = [];
-        
-        // Loop through each track in the chunk and create relationship records
-        for (let k = 0; k < trackChunk.length; k++) {
-          const track = trackChunk[k];
-          
-          if (!track || !track.id) {
-            console.warn(`Missing track data at index ${k}`);
-            continue;
-          }
-          
-          // Find the corresponding inserted track record
-          const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
-          
-          if (!insertedTrack || !insertedTrack.id) {
-            console.warn(`Could not find inserted track record for Spotify ID: ${track.id}, track name: ${track.name}`);
-            continue;
-          }
-          
-          if (!albumRecord || !albumRecord.id) {
-            console.error(`Invalid album record for track ${track.name} (${track.id}), albumRecord:`, albumRecord);
-            continue;
-          }
-          
-          // Add to the batch of track-album relationships to create
-          trackAlbumRecords.push({
-            track_id: insertedTrack.id,
-            album_id: albumRecord.id,
-            track_number: track.track_number || null,
-            disc_number: track.disc_number || null
+        const { data: insertedRelationships, error: relationshipError } = await supabase
+          .from("track_albums")
+          .upsert(relationshipBatch, {
+            onConflict: 'track_id,album_id',
+            returning: 'id'
           });
           
-          console.log(`Prepared track-album relationship: Track "${track.name}" (DB ID: ${insertedTrack.id}) -> Album "${album.name}" (DB ID: ${albumRecord.id})`);
+        if (relationshipError) {
+          console.error(`Error creating track-album relationships (batch ${batchIndex + 1}):`, relationshipError);
+          throw relationshipError;
         }
         
-        if (trackAlbumRecords.length === 0) {
-          console.warn(`No track-album relationships to create for album "${album.name}"`);
+        console.log(`Successfully created ${insertedRelationships?.length || 0} track-album relationships`);
+      }
+      
+      // Process artist relationships for each track
+      for (const track of trackChunk) {
+        if (!track || !Array.isArray(track.artists)) {
           continue;
         }
         
-        console.log(`Inserting ${trackAlbumRecords.length} track-album relationships for album "${album.name}" (ID: ${albumRecord.id})`);
+        // Find the inserted track ID
+        const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
+        if (!insertedTrack) continue;
         
-        // Process track-album relationships in small batches to avoid rate limits
-        const trackAlbumBatches = chunkArray(trackAlbumRecords, 25);
-        
-        for (const [batchIndex, batch] of trackAlbumBatches.entries()) {
+        // Process each artist
+        for (const [index, trackArtist] of track.artists.entries()) {
+          if (!trackArtist || !trackArtist.id) continue;
+          
           try {
-            console.log(`Processing track_albums batch ${batchIndex + 1}/${trackAlbumBatches.length} for album "${album.name}"`);
+            let dbArtistId;
             
-            // Log the exact data we're trying to insert
-            console.log(`Track-album batch data (first 3 items):`, batch.slice(0, 3));
-            
-            const { data: insertedRelationships, error: batchError } = await supabase
-              .from("track_albums")
-              .upsert(batch, {
-                onConflict: 'track_id,album_id',
-                returning: 'id,track_id,album_id'
-              });
-            
-            if (batchError) {
-              console.error(`Error creating track-album relationships (batch ${batchIndex + 1}):`, batchError);
-              
-              // Log detailed error to database
-              await supabase.rpc("log_error", {
-                p_error_type: "processing",
-                p_source: "process_artist",
-                p_message: `Error creating track-album relationships`,
-                p_stack_trace: batchError.stack || "",
-                p_context: { 
-                  albumId: albumRecord.id, 
-                  trackCount: batch.length,
-                  trackIds: batch.map(r => r.track_id).slice(0, 5),
-                  errorDetails: batchError.details || null
-                },
-                p_item_id: albumRecord.id,
-                p_item_type: "album"
-              });
+            // Check artist cache first
+            if (artistCache.has(trackArtist.id)) {
+              dbArtistId = artistCache.get(trackArtist.id);
             } else {
-              console.log(`Successfully created ${insertedRelationships?.length || 0} track-album relationships for album "${album.name}" (batch ${batchIndex + 1})`);
-            }
-          } catch (relationshipError) {
-            console.error(`Exception creating track-album relationships (batch ${batchIndex + 1}):`, relationshipError);
-            
-            // Log detailed error to database
-            await supabase.rpc("log_error", {
-              p_error_type: "processing",
-              p_source: "process_artist",
-              p_message: `Exception creating track-album relationships`,
-              p_stack_trace: relationshipError.stack || "",
-              p_context: { 
-                albumId: albumRecord.id, 
-                trackCount: batch.length
-              },
-              p_item_id: albumRecord.id,
-              p_item_type: "album"
-            });
-          }
-          
-          // Add a small delay between batches to avoid rate limits
-          if (batchIndex < trackAlbumBatches.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        }
-        
-        // Now process all artist relationships for these tracks
-        for (let k = 0; k < trackChunk.length; k++) {
-          const track = trackChunk[k];
-          const insertedTrack = insertedTracks.find(t => t.spotify_id === track.id);
-          
-          if (!track || !insertedTrack || !Array.isArray(track.artists)) {
-            console.warn(`Missing data for track-artist relationship at index ${k}`);
-            continue;
-          }
-          
-          // Process each artist on the track
-          for (const [index, trackArtist] of track.artists.entries()) {
-            if (!trackArtist || !trackArtist.id) {
-              console.warn(`Invalid artist data for track ${track.name}:`, trackArtist);
-              continue;
-            }
-            
-            try {
-              let dbArtistId;
+              // Get or create artist
+              const { data: existingArtist, error: artistError } = await supabase
+                .from("artists")
+                .select("id")
+                .eq("spotify_id", trackArtist.id)
+                .single();
               
-              // Check if we've already seen this artist
-              if (artistCache.has(trackArtist.id)) {
-                dbArtistId = artistCache.get(trackArtist.id);
-              } else {
-                // Try to get the artist from the database
-                const { data: existingTrackArtist, error: artistError } = await supabase
+              if (artistError && artistError.code === "PGRST116") {
+                // Create new artist with basic details
+                const { data: newArtist, error: insertError } = await supabase
                   .from("artists")
+                  .insert({
+                    name: trackArtist.name,
+                    spotify_id: trackArtist.id,
+                    spotify_url: trackArtist.external_urls?.spotify,
+                    metadata: {
+                      external_urls: trackArtist.external_urls,
+                      needs_full_processing: true
+                    }
+                  })
                   .select("id")
-                  .eq("spotify_id", trackArtist.id)
                   .single();
                 
-                if (artistError && artistError.code === "PGRST116") {
-                  // Artist doesn't exist, so insert it with basic information
-                  const { data: newArtist, error: insertArtistError } = await supabase
-                    .from("artists")
-                    .insert({
-                      name: trackArtist.name,
-                      spotify_id: trackArtist.id,
-                      spotify_url: trackArtist.external_urls?.spotify,
-                      metadata: {
-                        external_urls: trackArtist.external_urls,
-                        needs_full_processing: true // Flag to fully process this artist later
-                      }
-                    })
-                    .select("id")
-                    .single();
-                  
-                  if (insertArtistError) {
-                    console.error(`Error inserting artist ${trackArtist.id}:`, insertArtistError);
-                    continue;
-                  }
-                  
-                  dbArtistId = newArtist.id;
-                } else if (artistError) {
-                  console.error(`Error checking for artist ${trackArtist.id}:`, artistError);
+                if (insertError) {
+                  console.error(`Error inserting artist ${trackArtist.name}:`, insertError);
                   continue;
-                } else {
-                  dbArtistId = existingTrackArtist.id;
                 }
                 
-                // Cache the artist ID
-                artistCache.set(trackArtist.id, dbArtistId);
-              }
-              
-              // Create the track-artist relationship
-              // Is primary if it's our main artist or it's the first artist listed
-              const isPrimary = trackArtist.id === artistRecord.spotify_id || index === 0;
-              const { error: relationshipError } = await supabase
-                .from("track_artists")
-                .upsert({
-                  track_id: insertedTrack.id,
-                  artist_id: dbArtistId,
-                  is_primary: isPrimary
-                }, {
-                  onConflict: 'track_id,artist_id'
-                });
-              
-              if (relationshipError) {
-                console.error(`Error creating track-artist relationship:`, relationshipError);
+                dbArtistId = newArtist.id;
+              } else if (artistError) {
+                console.error(`Error checking for artist ${trackArtist.name}:`, artistError);
+                continue;
               } else {
-                console.log(`Created track-artist relationship for "${track.name}" and "${trackArtist.name}"`);
+                dbArtistId = existingArtist.id;
               }
-            } catch (artistError) {
-              console.error(`Error processing artist relationship for track ${track.name}:`, artistError);
-              // Continue with next artist
+              
+              // Cache the artist ID
+              artistCache.set(trackArtist.id, dbArtistId);
             }
+            
+            // Create track-artist relationship
+            const isPrimary = trackArtist.id === artistRecord.spotify_id || index === 0;
+            await supabase
+              .from("track_artists")
+              .upsert({
+                track_id: insertedTrack.id,
+                artist_id: dbArtistId,
+                is_primary: isPrimary
+              }, {
+                onConflict: 'track_id,artist_id'
+              });
+          } catch (artistError) {
+            console.error(`Error processing artist relationship:`, artistError);
+            // Continue with next artist
           }
         }
-      } catch (chunkError) {
-        console.error(`Error processing track chunk ${chunkIndex + 1} for album "${album.name}":`, chunkError);
-        // Continue with next chunk
       }
+      
+      totalProcessed += insertedTracks.length;
     }
     
-    // Verification query to make sure track-album relationships were created
+    // Verification query
     try {
       const { count, error: countError } = await supabase
         .from("track_albums")
@@ -954,24 +806,311 @@ async function processAlbumTracks(
       if (countError) {
         console.error(`Error verifying track-album relationships:`, countError);
       } else {
-        console.log(`Verification: Found ${count} track-album relationships for album "${album.name}" (ID: ${albumRecord.id})`);
+        console.log(`Verification: Found ${count} track-album relationships for album "${albumData.name}"`);
         
-        if (count === 0 && newTracks.length > 0) {
-          console.error(`WARNING: No track-album relationships were created despite processing ${newTracks.length} tracks!`);
+        if (count === 0 && totalProcessed > 0) {
+          console.error(`WARNING: No track-album relationships were created despite processing ${totalProcessed} tracks!`);
         }
       }
     } catch (verificationError) {
-      console.error(`Error during verification query:`, verificationError);
+      console.error(`Error during verification:`, verificationError);
     }
     
+    return {
+      success: true,
+      tracksProcessed: totalProcessed,
+      message: `Successfully processed ${totalProcessed} tracks for album "${albumData.name}"`
+    };
   } catch (error) {
-    console.error(`Error in processAlbumTracks for album ${album?.name || album?.id}:`, error);
+    console.error(`Error processing album ${albumData?.name || albumData?.id}:`, error);
+    return {
+      success: false,
+      tracksProcessed: 0,
+      message: `Error processing album: ${error.message}`,
+      error
+    };
   }
-  
-  return processedTracks;
 }
 
-// Process a specific artist by Spotify ID with enhanced validation
+/**
+ * Create or get artist record
+ */
+async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Promise<any> {
+  try {
+    // First check if artist exists in our database
+    const { data: existingArtist, error: checkError } = await supabase
+      .from("artists")
+      .select("*")
+      .eq("spotify_id", spotifyId)
+      .single();
+
+    if (!checkError) {
+      console.log(`Artist ${existingArtist.name} already exists in the database`);
+      return existingArtist;
+    }
+
+    if (checkError.code === "PGRST116") { // Not found
+      // Get artist details from Spotify
+      const artistData = await spotify.getArtist(spotifyId);
+      
+      if (!artistData || !artistData.id) {
+        throw new Error(`Failed to fetch artist data from Spotify for ID: ${spotifyId}`);
+      }
+      
+      // Insert the artist into our database
+      const { data: insertedArtist, error: insertError } = await supabase
+        .from("artists")
+        .insert({
+          name: artistData.name,
+          spotify_id: artistData.id,
+          genres: artistData.genres || [],
+          popularity: artistData.popularity,
+          spotify_url: artistData.external_urls?.spotify,
+          image_url: artistData.images?.[0]?.url,
+          metadata: {
+            followers: artistData.followers,
+            images: artistData.images,
+            external_urls: artistData.external_urls,
+          },
+          last_processed_at: new Date().toISOString(),
+        })
+        .select("*")
+        .single();
+
+      if (insertError) {
+        throw new Error(`Failed to insert artist: ${insertError.message}`);
+      }
+      
+      console.log(`Inserted new artist: ${artistData.name}`);
+      return insertedArtist;
+    } else {
+      throw new Error(`Failed to check for existing artist: ${checkError.message}`);
+    }
+  } catch (error) {
+    console.error(`Error in getOrCreateArtist for ${spotifyId}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Background processing function that processes albums in a batch
+ * This function is designed to run in the background using EdgeRuntime.waitUntil
+ */
+async function processBatchInBackground(
+  batchId: string, 
+  artistRecord: any, 
+  processedTrackIds: Set<string> = new Set()
+): Promise<void> {
+  try {
+    console.log(`Starting background processing for batch ${batchId}`);
+    
+    const spotify = new SpotifyClient();
+    
+    // Artist cache to avoid duplicate lookups
+    const artistCache = new Map<string, string>();
+    artistCache.set(artistRecord.spotify_id, artistRecord.id);
+    
+    // Get pending items from the batch
+    let hasMoreItems = true;
+    let processedItems = 0;
+    let failedItems = 0;
+    
+    while (hasMoreItems) {
+      // Get a small batch of pending items
+      const { data: pendingItems, error: itemsError } = await supabase
+        .from("processing_items")
+        .select("*")
+        .eq("batch_id", batchId)
+        .eq("status", "pending")
+        .order("priority", { ascending: false })
+        .limit(5); // Process 5 albums at a time to avoid timeouts
+        
+      if (itemsError) {
+        console.error(`Error fetching pending items:`, itemsError);
+        break;
+      }
+      
+      if (!pendingItems || pendingItems.length === 0) {
+        console.log(`No more pending items to process for batch ${batchId}`);
+        hasMoreItems = false;
+        break;
+      }
+      
+      console.log(`Processing batch of ${pendingItems.length} albums in background`);
+      
+      // Process each item sequentially
+      for (const item of pendingItems) {
+        try {
+          console.log(`Processing item ${item.id}: Album ID ${item.item_id}`);
+          
+          // Get the album details from Spotify
+          const albumData = await spotify.getAlbum(item.item_id);
+          
+          // Add the is_primary_artist_album flag
+          albumData.is_primary_artist_album = item.metadata.is_primary_artist_album || false;
+          
+          // Process the album
+          const result = await processAlbumWithTracks(
+            spotify,
+            albumData,
+            artistRecord,
+            artistCache,
+            processedTrackIds
+          );
+          
+          if (result.success) {
+            // Mark item as processed
+            await supabase
+              .from("processing_items")
+              .update({
+                status: "completed",
+                metadata: {
+                  ...item.metadata,
+                  completed_at: new Date().toISOString(),
+                  tracks_processed: result.tracksProcessed
+                }
+              })
+              .eq("id", item.id);
+              
+            processedItems++;
+          } else {
+            // Mark as error
+            await supabase
+              .from("processing_items")
+              .update({
+                status: "error",
+                retry_count: (item.retry_count || 0) + 1,
+                last_error: result.message
+              })
+              .eq("id", item.id);
+              
+            failedItems++;
+          }
+        } catch (itemError) {
+          console.error(`Error processing item ${item.id}:`, itemError);
+          
+          // Mark as error
+          await supabase
+            .from("processing_items")
+            .update({
+              status: "error",
+              retry_count: (item.retry_count || 0) + 1,
+              last_error: itemError.message
+            })
+            .eq("id", item.id);
+            
+          failedItems++;
+        }
+        
+        // Update batch progress
+        await updateBatchProgress(batchId);
+        
+        // Add a small delay between items to avoid API rate limits
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    
+    // Check if all items are processed
+    const { count: pendingCount } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "pending");
+      
+    if (pendingCount === 0) {
+      // Mark batch as completed
+      await supabase
+        .from("processing_batches")
+        .update({
+          status: "completed",
+          completed_at: new Date().toISOString()
+        })
+        .eq("id", batchId);
+        
+      console.log(`Background processing completed for batch ${batchId}`);
+    } else {
+      console.log(`Background processing stopped with ${pendingCount} items still pending for batch ${batchId}`);
+    }
+  } catch (error) {
+    console.error(`Error in background processing for batch ${batchId}:`, error);
+    
+    // Log error to our database
+    try {
+      await supabase.rpc("log_error", {
+        p_error_type: "processing",
+        p_source: "process_artist_background",
+        p_message: `Error in background processing`,
+        p_stack_trace: error.stack || "",
+        p_context: { batchId },
+        p_item_id: batchId,
+        p_item_type: "batch"
+      });
+    } catch (logError) {
+      console.error("Failed to log error to database:", logError);
+    }
+  }
+}
+
+/**
+ * Helper function to update batch progress
+ */
+async function updateBatchProgress(batchId: string): Promise<void> {
+  try {
+    // Get accurate counts from the database
+    const { count: totalItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId);
+    
+    const { count: completedItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "completed");
+    
+    const { count: errorItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "error");
+    
+    // Get total tracks processed
+    const { data: completedItemsData } = await supabase
+      .from("processing_items")
+      .select("metadata")
+      .eq("batch_id", batchId)
+      .eq("status", "completed");
+      
+    let totalTracksProcessed = 0;
+    if (completedItemsData) {
+      completedItemsData.forEach(item => {
+        if (item.metadata && typeof item.metadata.tracks_processed === 'number') {
+          totalTracksProcessed += item.metadata.tracks_processed;
+        }
+      });
+    }
+    
+    // Update the batch with accurate progress
+    await supabase
+      .from("processing_batches")
+      .update({
+        items_total: totalItems || 0,
+        items_processed: completedItems || 0,
+        items_failed: errorItems || 0,
+        metadata: {
+          tracks_processed: totalTracksProcessed
+        }
+      })
+      .eq("id", batchId);
+  } catch (error) {
+    console.error(`Error updating batch progress for ${batchId}:`, error);
+  }
+}
+
+/**
+ * Enhanced process tracks from an album function
+ * Redesigned to use job-based architecture with background processing
+ */
 async function processArtist(spotifyId: string): Promise<{success: boolean, message: string, data?: any}> {
   try {
     console.log(`Processing artist with Spotify ID: ${spotifyId}`);
@@ -981,123 +1120,149 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
     // Get or create the artist record
     const artistRecord = await getOrCreateArtist(spotify, spotifyId);
     
+    // Create a processing batch for this artist
+    const { data: newBatch, error: batchError } = await supabase
+      .from("processing_batches")
+      .insert({
+        batch_type: "process_artist",
+        status: "processing",
+        metadata: {
+          artist_id: artistRecord.id,
+          artist_name: artistRecord.name,
+          spotify_id: spotifyId,
+          started_at: new Date().toISOString()
+        }
+      })
+      .select("id")
+      .single();
+      
+    if (batchError) {
+      throw new Error(`Failed to create processing batch: ${batchError.message}`);
+    }
+    
+    const batchId = newBatch.id;
+    console.log(`Created processing batch ${batchId} for artist ${artistRecord.name}`);
+    
     // Cache for artists we encounter to avoid duplicate lookups
     const artistCache = new Map<string, string>();
     artistCache.set(spotifyId, artistRecord.id);
 
-    // Enhanced getting all artist albums from Spotify
+    // Get artist albums from Spotify
     const allAlbums = await fetchArtistAlbums(spotify, spotifyId);
     
-    console.log(`Processing ${allAlbums.length} albums for artist ${artistRecord.name}`);
+    console.log(`Found ${allAlbums.length} total albums for artist ${artistRecord.name}`);
     
-    // Track deduplication map using Spotify IDs
+    // Track which tracks we've already processed
     const processedTrackIds = new Set<string>();
-    const processedTracks = [];
     
-    // Enhanced tracking statistics
-    const trackStats = {
-      total: 0,
-      new: 0,
-      duplicates: 0,
-      primary: 0,
-      features: 0,
-      byAlbumType: {
-        album: 0,
-        single: 0,
-        compilation: 0,
-        appears_on: 0,
-        unknown: 0
-      }
-    };
-    
-    // Process albums in smaller chunks to avoid timeouts
-    const albumChunkSize = 3; // Kept at 3 as per original code
-    const albumChunks = chunkArray(allAlbums, albumChunkSize);
-    
-    console.log(`Split ${allAlbums.length} albums into ${albumChunks.length} chunks of size ${albumChunkSize}`);
-    
-    // Counters for error tracking
-    let successfulAlbums = 0;
-    let failedAlbums = 0;
-    
-    for (let i = 0; i < albumChunks.length; i++) {
-      const albumChunk = albumChunks[i];
-      console.log(`Processing album chunk ${i + 1}/${albumChunks.length}`);
-      
-      // Process each album in the chunk
-      const albumPromises = albumChunk.map(async (album) => {
-        if (!album || !album.id || !album.name) {
-          console.warn(`Invalid album data:`, album);
-          failedAlbums++;
-          return;
+    // Update batch with total albums
+    await supabase
+      .from("processing_batches")
+      .update({
+        items_total: allAlbums.length,
+        metadata: {
+          ...newBatch.metadata,
+          total_albums: allAlbums.length
         }
+      })
+      .eq("id", batchId);
+    
+    // Split albums into initial batch and remainder for background processing
+    const initialBatchSize = 3; // Process 3 albums immediately for responsive feedback
+    const initialBatch = allAlbums.slice(0, initialBatchSize);
+    const remainingAlbums = allAlbums.slice(initialBatchSize);
+    
+    console.log(`Processing initial batch of ${initialBatch.length} albums immediately`);
+    
+    // Process initial batch albums immediately (for API responsiveness)
+    let initialTracksProcessed = 0;
+    let initialAlbumsProcessed = 0;
+    
+    for (const album of initialBatch) {
+      try {
+        const result = await processAlbumWithTracks(
+          spotify, 
+          album, 
+          artistRecord, 
+          artistCache,
+          processedTrackIds
+        );
         
-        try {
-          // Store the album in our database first
-          const albumRecord = await getOrCreateAlbum(album, artistRecord);
+        if (result.success) {
+          initialTracksProcessed += result.tracksProcessed;
+          initialAlbumsProcessed++;
           
-          const tracks = await processAlbumTracks(
-            spotify, 
-            album, 
-            albumRecord,
-            artistRecord, 
-            artistCache, 
-            processedTrackIds,
-            trackStats
-          );
-          
-          if (tracks.length > 0) {
-            processedTracks.push(...tracks);
-            
-            // Count primary vs. feature tracks
-            if (album.is_primary_artist_album) {
-              trackStats.primary += tracks.length;
-            } else {
-              trackStats.features += tracks.length;
-            }
-          }
-          
-          successfulAlbums++;
-        } catch (albumError) {
-          console.error(`Error processing album ${album.id} (${album.name}):`, albumError);
-          failedAlbums++;
-          
-          await supabase.rpc("log_error", {
-            p_error_type: "processing",
-            p_source: "process_artist",
-            p_message: `Error processing album`,
-            p_stack_trace: albumError.stack || "",
-            p_context: { albumId: album.id, albumName: album.name },
-            p_item_id: spotifyId,
-            p_item_type: "artist"
-          });
-          
-          // Continue with next album
+          // Update batch progress
+          await supabase
+            .from("processing_batches")
+            .update({
+              items_processed: initialAlbumsProcessed,
+              metadata: {
+                ...newBatch.metadata,
+                tracks_processed: initialTracksProcessed,
+                albums_processed: initialAlbumsProcessed
+              }
+            })
+            .eq("id", batchId);
         }
-      });
-      
-      // Wait for all albums in this chunk to be processed
-      await Promise.all(albumPromises);
-      
-      // Log progress after each chunk
-      console.log(`Processed ${processedTrackIds.size} tracks so far (${i + 1}/${albumChunks.length} album chunks)`);
-      console.log(`Album processing stats: ${successfulAlbums} successful, ${failedAlbums} failed`);
-      
-      // Add more detailed tracking progress
-      console.log(`Track breakdown - Primary: ${trackStats.primary}, Features: ${trackStats.features}`);
-      
-      // Prevent long-running function timeouts by adding a small delay
-      if (i < albumChunks.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-      
-      // If we've already gathered a large number of tracks, break to avoid timeout
-      if (processedTrackIds.size > 10000) {
-        console.warn(`Reached large track count (${processedTrackIds.size}), stopping album processing to avoid timeout`);
-        break;
+      } catch (albumError) {
+        console.error(`Error processing album ${album.name} in initial batch:`, albumError);
+        // Continue with next album
       }
     }
-
+    
+    // Store remaining albums in processing queue for background processing
+    if (remainingAlbums.length > 0) {
+      console.log(`Queueing ${remainingAlbums.length} albums for background processing`);
+      
+      // Create processing items for remaining albums
+      const processingItems = remainingAlbums.map((album, index) => ({
+        batch_id: batchId,
+        item_type: "album",
+        item_id: album.id,
+        status: "pending",
+        priority: album.is_primary_artist_album ? 10 : 5, // Prioritize primary albums
+        metadata: {
+          name: album.name,
+          is_primary_artist_album: album.is_primary_artist_album || false,
+          album_type: album.album_type || "unknown",
+          position: index
+        }
+      }));
+      
+      // Insert in smaller batches to avoid request size limits
+      const itemBatches = chunkArray(processingItems, 50);
+      
+      for (const [batchIndex, itemBatch] of itemBatches.entries()) {
+        console.log(`Inserting processing items batch ${batchIndex + 1}/${itemBatches.length}`);
+        
+        const { error: insertError } = await supabase
+          .from("processing_items")
+          .insert(itemBatch);
+          
+        if (insertError) {
+          console.error(`Error inserting processing items batch ${batchIndex + 1}:`, insertError);
+        }
+      }
+      
+      // Start background processing
+      console.log(`Starting background processing for remaining ${remainingAlbums.length} albums`);
+      
+      // Use EdgeRuntime.waitUntil to continue processing in the background
+      EdgeRuntime.waitUntil(
+        processBatchInBackground(batchId, artistRecord, processedTrackIds)
+      );
+    } else {
+      // Mark the batch as completed since we've processed all albums
+      await supabase
+        .from("processing_batches")
+        .update({
+          status: "completed",
+          completed_at: new Date().toISOString()
+        })
+        .eq("id", batchId);
+    }
+    
     // Update the artist's last_processed_at timestamp
     await supabase
       .from("artists")
@@ -1105,74 +1270,23 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
         last_processed_at: new Date().toISOString()
       })
       .eq("spotify_id", spotifyId);
-
-    // Enhanced statistics reporting
-    console.log(`=== ARTIST PROCESSING STATS FOR ${artistRecord.name} ===`);
-    console.log(`Total unique tracks: ${processedTrackIds.size}`);
-    console.log(`Tracks stored in database: ${processedTracks.length}`);
-    console.log(`Albums processed: ${successfulAlbums} successful, ${failedAlbums} failed`);
-    console.log(`Primary artist tracks: ${trackStats.primary}`);
-    console.log(`Feature tracks: ${trackStats.features}`);
-    console.log(`Tracks by album type: ${JSON.stringify(trackStats.byAlbumType, null, 2)}`);
-    console.log(`Total tracks seen: ${trackStats.total} (${trackStats.new} new, ${trackStats.duplicates} duplicates)`);
     
-    // Verification stage - making a direct count query to verify database state
-    try {
-      const { count: dbTrackCount, error: countError } = await supabase
-        .from("tracks")
-        .select("*", { count: "exact", head: true })
-        .eq("artist_id", artistRecord.id);
-        
-      if (!countError) {
-        console.log(`Database verification: ${dbTrackCount} tracks for this artist in database`);
-        
-        if (dbTrackCount !== processedTracks.length) {
-          console.log(`Note: Database count (${dbTrackCount}) differs from tracks stored in this session (${processedTracks.length}). This may indicate tracks from previous runs.`);
-        }
-      }
-      
-      // Add verification for track_albums table to confirm relationships are created
-      const { count: trackAlbumCount, error: trackAlbumError } = await supabase
-        .from("track_albums")
-        .select("*", { count: "exact", head: true })
-        .eq("album_id", "in", `(select id from albums where artist_id = '${artistRecord.id}')`);
-        
-      if (!trackAlbumError) {
-        console.log(`Track-album relationship verification: ${trackAlbumCount} relationships found for this artist's albums`);
-      }
-    } catch (verificationError) {
-      console.error(`Error verifying counts in database:`, verificationError);
-    }
-
-    // Prepare a reduced response to avoid response size limits
-    // IMPORTANT: Simplified to avoid JSON serialization issues
-    const summaryData = {
-      artist: artistRecord.name,
-      artistId: artistRecord.id,
-      tracksProcessed: processedTrackIds.size,
-      tracksStored: processedTracks.length,
-      albumsProcessed: {
-        total: allAlbums.length,
-        successful: successfulAlbums,
-        failed: failedAlbums
-      },
-      trackStats: {
-        primary: trackStats.primary,
-        features: trackStats.features,
-        byAlbumType: trackStats.byAlbumType,
-        total: trackStats.total,
-        new: trackStats.new,
-        duplicates: trackStats.duplicates
-      }
-    };
-
+    // Return a response with minimal data to avoid serialization issues
     return {
       success: true,
-      message: `Successfully processed artist ${artistRecord.name} with ${processedTrackIds.size} unique tracks`,
-      data: summaryData
+      message: `Processing artist ${artistRecord.name}: ${initialAlbumsProcessed} albums processed immediately, ${remainingAlbums.length} queued for background processing`,
+      data: {
+        artist: artistRecord.name,
+        artistId: artistRecord.id,
+        totalAlbums: allAlbums.length,
+        processedImmediately: initialAlbumsProcessed,
+        tracksProcessedImmediately: initialTracksProcessed,
+        albumsQueuedForBackground: remainingAlbums.length,
+        batchId: batchId
+      }
     };
   } catch (error) {
-    console.error(`Error processing artist ${spotifyId}:`, error);
+    console.error(`Error in processArtist for ${spotifyId}:`, error);
     
     // Log error to our database
     try {
@@ -1196,7 +1310,7 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
   }
 }
 
-// Process all artists in a batch
+// Process a batch of artists
 async function processBatch(batchId: string): Promise<{
   success: boolean, 
   message: string, 
@@ -1379,41 +1493,6 @@ async function processBatch(batchId: string): Promise<{
   }
 }
 
-// Helper function to update batch progress
-async function updateBatchProgress(batchId: string): Promise<void> {
-  try {
-    // Get accurate counts from the database for this batch
-    const { count: totalItems } = await supabase
-      .from("processing_items")
-      .select("*", { count: "exact", head: true })
-      .eq("batch_id", batchId);
-    
-    const { count: completedItems } = await supabase
-      .from("processing_items")
-      .select("*", { count: "exact", head: true })
-      .eq("batch_id", batchId)
-      .eq("status", "completed");
-    
-    const { count: errorItems } = await supabase
-      .from("processing_items")
-      .select("*", { count: "exact", head: true })
-      .eq("batch_id", batchId)
-      .eq("status", "error");
-    
-    // Update the batch with accurate progress
-    await supabase
-      .from("processing_batches")
-      .update({
-        items_total: totalItems || 0,
-        items_processed: completedItems || 0,
-        items_failed: errorItems || 0,
-      })
-      .eq("id", batchId);
-  } catch (error) {
-    console.error(`Error updating batch progress for ${batchId}:`, error);
-  }
-}
-
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
@@ -1430,7 +1509,7 @@ serve(async (req) => {
       // Process all artists in a batch
       const result = await processBatch(batchId);
       
-      // Ensure response is properly formatted as JSON with minimal data
+      // Use safe serialization to avoid JSON issues
       try {
         const safeResponse = {
           success: result.success,
@@ -1471,22 +1550,23 @@ serve(async (req) => {
         );
       }
     } else if (spotifyId) {
-      // Process a single artist (maintaining backward compatibility)
+      // Process a single artist
       const result = await processArtist(spotifyId);
       
-      // Use a more minimal response to avoid JSON serialization issues
+      // Use safe serialization to avoid JSON issues
       try {
-        // Create a minimal response object that's guaranteed to serialize properly
+        // Create a minimal response that's guaranteed to serialize properly
         const safeResponse = {
           success: result.success,
           message: result.message,
           data: result.data ? safeSerialize({
             artist: result.data.artist || "",
-            tracksProcessed: result.data.tracksProcessed || 0,
-            tracksStored: result.data.tracksStored || 0,
-            primaryTracks: result.data.trackStats?.primary || 0,
-            featureTracks: result.data.trackStats?.features || 0,
-            albumsProcessed: result.data.albumsProcessed?.total || 0
+            artistId: result.data.artistId || "",
+            totalAlbums: result.data.totalAlbums || 0,
+            processedImmediately: result.data.processedImmediately || 0,
+            tracksProcessedImmediately: result.data.tracksProcessedImmediately || 0,
+            albumsQueuedForBackground: result.data.albumsQueuedForBackground || 0,
+            batchId: result.data.batchId || null
           }) : null
         };
         
@@ -1502,11 +1582,12 @@ serve(async (req) => {
         );
       } catch (jsonError) {
         console.error("Error serializing artist result:", jsonError);
-        // Fall back to an even more minimal response if serialization fails
+        
+        // Fall back to an even more minimal response
         return new Response(
           JSON.stringify({
             success: true,
-            message: "Processing completed but response was too large to serialize. Check logs for details.",
+            message: "Processing started but response was too large to serialize. Check logs for details.",
             error: String(jsonError)
           }),
           {
@@ -1549,7 +1630,7 @@ serve(async (req) => {
       console.error("Error logging to database:", logError);
     }
 
-    // Return a minimal error response that's guaranteed to serialize properly
+    // Return a minimal error response
     return new Response(
       JSON.stringify({
         success: false,
