@@ -18,8 +18,8 @@ async function processBatch(batchType: string): Promise<{
   failed?: number;
 }> {
   try {
-    // Generate a unique worker ID
-    const workerId = v4.generate();
+    // Generate a unique worker ID - Fix: proper usage of v4
+    const workerId = crypto.randomUUID();
     
     console.log(`Worker ${workerId} claiming a batch of type: ${batchType}`);
     
