@@ -162,7 +162,7 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
 }
 
 /**
- * Enhanced process album tracks helper function with better pagination
+ * Enhanced process album tracks function with better pagination
  */
 async function fetchAlbumTracks(spotify: SpotifyClient, albumId: string): Promise<any[]> {
   let albumTracks = [];
@@ -1042,10 +1042,12 @@ serve(async (req) => {
       console.error("Error logging to database:", logError);
     }
 
+    // Ensure we always return a properly formatted JSON response
     return new Response(
       JSON.stringify({
         success: false,
-        error: error.message,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+        errorDetails: error instanceof Error ? error.stack : null,
       }),
       {
         status: 500,
