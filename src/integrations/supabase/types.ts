@@ -9,6 +9,65 @@ export type Json =
 export type Database = {
   public: {
     Tables: {
+      albums: {
+        Row: {
+          album_type: string | null
+          artist_id: string | null
+          discovered_at: string
+          id: string
+          image_url: string | null
+          is_primary_artist_album: boolean | null
+          metadata: Json | null
+          name: string
+          popularity: number | null
+          release_date: string | null
+          spotify_id: string | null
+          spotify_url: string | null
+          total_tracks: number | null
+          updated_at: string
+        }
+        Insert: {
+          album_type?: string | null
+          artist_id?: string | null
+          discovered_at?: string
+          id?: string
+          image_url?: string | null
+          is_primary_artist_album?: boolean | null
+          metadata?: Json | null
+          name: string
+          popularity?: number | null
+          release_date?: string | null
+          spotify_id?: string | null
+          spotify_url?: string | null
+          total_tracks?: number | null
+          updated_at?: string
+        }
+        Update: {
+          album_type?: string | null
+          artist_id?: string | null
+          discovered_at?: string
+          id?: string
+          image_url?: string | null
+          is_primary_artist_album?: boolean | null
+          metadata?: Json | null
+          name?: string
+          popularity?: number | null
+          release_date?: string | null
+          spotify_id?: string | null
+          spotify_url?: string | null
+          total_tracks?: number | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "albums_artist_id_fkey"
+            columns: ["artist_id"]
+            isOneToOne: false
+            referencedRelation: "artists"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       api_rate_limits: {
         Row: {
           api_name: string
@@ -263,6 +322,51 @@ export type Database = {
         }
         Relationships: []
       }
+      track_albums: {
+        Row: {
+          album_id: string
+          created_at: string
+          disc_number: number | null
+          id: string
+          track_id: string
+          track_number: number | null
+          updated_at: string
+        }
+        Insert: {
+          album_id: string
+          created_at?: string
+          disc_number?: number | null
+          id?: string
+          track_id: string
+          track_number?: number | null
+          updated_at?: string
+        }
+        Update: {
+          album_id?: string
+          created_at?: string
+          disc_number?: number | null
+          id?: string
+          track_id?: string
+          track_number?: number | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "track_albums_album_id_fkey"
+            columns: ["album_id"]
+            isOneToOne: false
+            referencedRelation: "albums"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "track_albums_track_id_fkey"
+            columns: ["track_id"]
+            isOneToOne: false
+            referencedRelation: "tracks"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       track_artists: {
         Row: {
           artist_id: string
@@ -355,7 +459,6 @@ export type Database = {
       }
       tracks: {
         Row: {
-          album_name: string | null
           artist_id: string
           discovered_at: string
           id: string
@@ -369,7 +472,6 @@ export type Database = {
           updated_at: string
         }
         Insert: {
-          album_name?: string | null
           artist_id: string
           discovered_at?: string
           id?: string
@@ -383,7 +485,6 @@ export type Database = {
           updated_at?: string
         }
         Update: {
-          album_name?: string | null
           artist_id?: string
           discovered_at?: string
           id?: string

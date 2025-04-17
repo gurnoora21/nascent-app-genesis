@@ -454,11 +454,74 @@ async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Pro
 }
 
 /**
+ * Create or get album record with the new database structure
+ */
+async function getOrCreateAlbum(album: any, artistRecord: any): Promise<any> {
+  try {
+    // First check if album exists in our database
+    const { data: existingAlbum, error: checkError } = await supabase
+      .from("albums")
+      .select("*")
+      .eq("spotify_id", album.id)
+      .single();
+
+    if (!checkError) {
+      console.log(`Album ${existingAlbum.name} already exists in the database`);
+      return existingAlbum;
+    }
+
+    if (checkError.code === "PGRST116") { // Not found
+      // Insert the album into our database
+      const { data: insertedAlbum, error: insertError } = await supabase
+        .from("albums")
+        .insert({
+          name: album.name,
+          spotify_id: album.id,
+          release_date: album.release_date,
+          album_type: album.album_type,
+          total_tracks: album.total_tracks,
+          image_url: album.images?.[0]?.url,
+          spotify_url: album.external_urls?.spotify,
+          artist_id: artistRecord.id,
+          is_primary_artist_album: album.is_primary_artist_album || false,
+          popularity: album.popularity,
+          metadata: {
+            album_group: album.album_group,
+            available_markets: album.available_markets,
+            external_urls: album.external_urls,
+            href: album.href,
+            images: album.images,
+            release_date_precision: album.release_date_precision,
+            restrictions: album.restrictions,
+            uri: album.uri
+          }
+        })
+        .select("*")
+        .single();
+
+      if (insertError) {
+        throw new Error(`Failed to insert album: ${insertError.message}`);
+      }
+      
+      console.log(`Inserted new album: ${album.name}`);
+      return insertedAlbum;
+    } else {
+      throw new Error(`Failed to check for existing album: ${checkError.message}`);
+    }
+  } catch (error) {
+    console.error(`Error in getOrCreateAlbum for ${album.name}:`, error);
+    throw error;
+  }
+}
+
+/**
  * Enhanced process tracks from an album function with better handling of featured artists
+ * Now updated to work with the new database schema
  */
 async function processAlbumTracks(
   spotify: SpotifyClient, 
   album: any, 
+  albumRecord: any,
   artistRecord: any, 
   artistCache: Map<string, string>,
   processedTrackIds: Set<string>,
@@ -548,25 +611,15 @@ async function processAlbumTracks(
             name: track.name,
             spotify_id: track.id,
             artist_id: artistRecord.id, // Primary artist is the one we're processing
-            album_name: album.name,
-            release_date: album.release_date,
             spotify_url: track.external_urls?.spotify,
             preview_url: track.preview_url,
+            release_date: album.release_date,
             metadata: {
               disc_number: track.disc_number,
               track_number: track.track_number,
               duration_ms: track.duration_ms,
               explicit: track.explicit,
-              external_urls: track.external_urls,
-              album: {
-                id: album.id,
-                name: album.name,
-                type: album.album_type,
-                total_tracks: album.total_tracks,
-                release_date: album.release_date,
-                release_date_precision: album.release_date_precision,
-                is_primary_artist_album: album.is_primary_artist_album || false
-              }
+              external_urls: track.external_urls
             }
           };
         }).filter(record => record !== null); // Filter out any null records
@@ -596,6 +649,39 @@ async function processAlbumTracks(
         
         console.log(`Upserted ${insertedTracks.length} tracks from album "${album.name}"`);
         processedTracks.push(...insertedTracks);
+        
+        // Now create track-album relationships
+        const trackAlbumRecords = [];
+        for (let k = 0; k < trackChunk.length; k++) {
+          const track = trackChunk[k];
+          const insertedTrack = insertedTracks[k];
+          
+          if (!track || !insertedTrack) {
+            console.warn(`Missing data for track-album relationship at index ${k}`);
+            continue;
+          }
+          
+          trackAlbumRecords.push({
+            track_id: insertedTrack.id,
+            album_id: albumRecord.id,
+            track_number: track.track_number,
+            disc_number: track.disc_number
+          });
+        }
+        
+        if (trackAlbumRecords.length > 0) {
+          const { error: insertTrackAlbumError } = await supabase
+            .from("track_albums")
+            .upsert(trackAlbumRecords, {
+              onConflict: 'track_id,album_id'
+            });
+            
+          if (insertTrackAlbumError) {
+            console.error(`Error creating track-album relationships:`, insertTrackAlbumError);
+          } else {
+            console.log(`Created ${trackAlbumRecords.length} track-album relationships for album "${album.name}"`);
+          }
+        }
         
         // Now process all artist relationships for these tracks
         for (let k = 0; k < trackChunk.length; k++) {
@@ -759,9 +845,13 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
         }
         
         try {
+          // Store the album in our database first
+          const albumRecord = await getOrCreateAlbum(album, artistRecord);
+          
           const tracks = await processAlbumTracks(
             spotify, 
             album, 
+            albumRecord,
             artistRecord, 
             artistCache, 
             processedTrackIds,
