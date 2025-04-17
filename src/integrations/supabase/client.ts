@@ -32,3 +32,34 @@ export function formatSpotifyReleaseDate(releaseDate: string | null): string | n
     return null;
   }
 }
+
+// Determine if an error is transient (retryable) or permanent
+export function isTransientError(error: Error): boolean {
+  // Network errors, timeouts, and rate limiting are usually transient
+  const transientErrorPatterns = [
+    /network/i,
+    /timeout/i,
+    /rate limit/i,
+    /429/,
+    /503/,
+    /504/,
+    /connection/i,
+    /temporarily unavailable/i,
+    /too many requests/i
+  ];
+  
+  const errorString = error.message + (error.stack || '');
+  
+  return transientErrorPatterns.some(pattern => pattern.test(errorString));
+}
+
+// Calculate backoff time based on retry count with jitter
+export function calculateBackoff(retryCount: number, baseDelay = 1000): number {
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
+  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
+  
+  // Add random jitter (±25%)
+  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+  
+  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
+}

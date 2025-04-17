@@ -8,9 +8,57 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Create a new batch for processing tracks
+// Calculate backoff time based on retry count with jitter
+function calculateBackoff(retryCount: number, baseDelay = 1000): number {
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
+  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
+  
+  // Add random jitter (±25%)
+  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+  
+  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
+}
+
+// Check if API is rate limited
+async function isApiRateLimited(apiName: string, endpoint: string): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from("api_rate_limits")
+      .select("*")
+      .eq("api_name", apiName)
+      .eq("endpoint", endpoint)
+      .single();
+    
+    if (error || !data) return false;
+    
+    // If we're out of requests and reset time is in the future
+    if (
+      data.requests_remaining !== null && 
+      data.requests_remaining <= 0 && 
+      data.reset_at && 
+      new Date(data.reset_at) > new Date()
+    ) {
+      return true;
+    }
+    
+    return false;
+  } catch (err) {
+    console.error("Error checking rate limits:", err);
+    return false;
+  }
+}
+
+// Create a new batch for processing tracks with validation
 async function createTracksBatch(limit: number = 50): Promise<string> {
   try {
+    // Pre-flight check: Check if APIs are rate limited
+    const spotifyLimited = await isApiRateLimited("spotify", "/tracks");
+    const geniusLimited = await isApiRateLimited("genius", "/search");
+    
+    if (spotifyLimited || geniusLimited) {
+      throw new Error(`APIs currently rate limited, deferring batch creation`);
+    }
+    
     // First, check if there's an existing batch of type identify_producers
     const { data: existingBatches, error: batchCheckError } = await supabase
       .from("processing_batches")
@@ -38,7 +86,11 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
         .insert({
           batch_type: "identify_producers",
           status: "pending",
-          metadata: { limit }
+          metadata: { 
+            limit,
+            created_by: "process-tracks-batch",
+            created_at: new Date().toISOString()
+          }
         })
         .select("id")
         .single();
@@ -52,11 +104,24 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       console.log(`Created new identify_producers batch ${batchId}`);
     }
     
+    // Exclude tracks that:
+    // 1. Already have producers
+    // 2. Are currently in a pending processing item
+    // 3. Have failed processing 5+ times
+    const subQuery = supabase
+      .from("processing_items")
+      .select("item_id")
+      .eq("item_type", "track")
+      .in("status", ["pending", "processing"])
+      .or(`retry_count.gte.5,status.eq.error`);
+      
     // Get tracks that don't have producers yet
     const { data: tracks, error: tracksError } = await supabase
       .from("tracks")
-      .select("id")
+      .select("id, name, artist_id, popularity")
       .not("id", "in", supabase.from("track_producers").select("track_id"))
+      .not("id", "in", subQuery)
+      .order("popularity", { ascending: false }) // Process popular tracks first
       .limit(limit);
     
     if (tracksError) {
@@ -68,12 +133,17 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       throw new Error("No tracks found without producers");
     }
     
-    // Add tracks to the batch
+    // Add tracks to the batch with priority based on popularity
     const batchItems = tracks.map((track) => ({
       batch_id: batchId,
       item_type: "track",
       item_id: track.id,
-      status: "pending"
+      status: "pending",
+      priority: track.popularity ? Math.min(Math.floor(track.popularity / 10), 10) : 5, // 0-10 priority scale
+      metadata: {
+        track_name: track.name,
+        artist_id: track.artist_id
+      }
     }));
     
     const { error: itemsError } = await supabase
@@ -109,12 +179,26 @@ async function processTracksBatch(): Promise<{
   batchId?: string;
   processed?: number;
   failed?: number;
+  status?: string;
 }> {
   try {
     // Generate a unique worker ID
     const workerId = crypto.randomUUID();
     
     console.log(`Worker ${workerId} claiming a batch of type: identify_producers`);
+    
+    // Pre-flight check: Check if APIs are rate limited
+    const spotifyLimited = await isApiRateLimited("spotify", "/tracks");
+    const geniusLimited = await isApiRateLimited("genius", "/search");
+    const discogsLimited = await isApiRateLimited("discogs", "/database/search");
+    
+    if (spotifyLimited || geniusLimited || discogsLimited) {
+      return {
+        success: true,
+        message: "APIs currently rate limited, skipping batch processing",
+        status: "delayed"
+      };
+    }
     
     // Claim a batch to process
     const { data: batchId, error: claimError } = await supabase.rpc(
@@ -134,11 +218,36 @@ async function processTracksBatch(): Promise<{
     if (!batchId) {
       return {
         success: true,
-        message: "No pending batches found to process"
+        message: "No pending batches found to process",
+        status: "idle"
       };
     }
     
     console.log(`Worker ${workerId} claimed batch ${batchId}`);
+    
+    // Get batch details
+    const { data: batchDetails, error: batchDetailsError } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .eq("id", batchId)
+      .single();
+    
+    if (batchDetailsError) {
+      console.error("Error getting batch details:", batchDetailsError);
+      throw batchDetailsError;
+    }
+    
+    // Calculate optimal batch size based on API limits and batch history
+    // Start with conservative default 
+    let batchSize = 10;
+    
+    // Adjust based on rate limit data if available
+    if (!spotifyLimited && !geniusLimited && !discogsLimited) {
+      // If no rate limiting detected, we can be more aggressive
+      batchSize = 15;
+    }
+    
+    // Additional adjustments based on batch history could be added here
     
     // Get items to process
     const { data: items, error: itemsError } = await supabase
@@ -148,7 +257,7 @@ async function processTracksBatch(): Promise<{
       .eq("status", "pending")
       .order("priority", { ascending: false })
       .order("created_at", { ascending: true })
-      .limit(10); // Process 10 items at a time to avoid timeouts
+      .limit(batchSize);
     
     if (itemsError) {
       console.error("Error getting batch items:", itemsError);
@@ -171,7 +280,8 @@ async function processTracksBatch(): Promise<{
         message: "Batch claimed but no items to process",
         batchId,
         processed: 0,
-        failed: 0
+        failed: 0,
+        status: "completed"
       };
     }
     
@@ -180,9 +290,18 @@ async function processTracksBatch(): Promise<{
     const processedItems: string[] = [];
     const failedItems: string[] = [];
     
-    // Process each item in the batch
+    // Process each item in the batch with proper handling
     for (const item of items) {
       try {
+        // Skip items scheduled for future retry based on metadata
+        if (
+          item.metadata?.retry_after && 
+          new Date(item.metadata.retry_after) > new Date()
+        ) {
+          console.log(`Skipping item ${item.id} - scheduled for retry after ${item.metadata.retry_after}`);
+          continue;
+        }
+        
         console.log(`Processing item ${item.id}: ${item.item_type}/${item.item_id}`);
         
         if (item.item_type === "track") {
@@ -195,9 +314,18 @@ async function processTracksBatch(): Promise<{
                 "Content-Type": "application/json",
                 "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`
               },
-              body: JSON.stringify({ trackId: item.item_id })
+              body: JSON.stringify({ 
+                trackId: item.item_id,
+                batchItemId: item.id,
+                workerId
+              })
             }
           );
+          
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP error ${response.status}: ${errorText}`);
+          }
           
           const result = await response.json();
           
@@ -212,7 +340,12 @@ async function processTracksBatch(): Promise<{
               status: "completed",
               metadata: {
                 ...item.metadata,
-                result
+                result: {
+                  producers: result.data?.producers?.length || 0,
+                  sources: result.data?.sources || [],
+                  confidence: result.data?.confidence || "medium"
+                },
+                completed_at: new Date().toISOString()
               }
             })
             .eq("id", item.id);
@@ -228,7 +361,8 @@ async function processTracksBatch(): Promise<{
               status: "completed",
               metadata: {
                 ...item.metadata,
-                warning: `Unknown item type: ${item.item_type}`
+                warning: `Unknown item type: ${item.item_type}`,
+                completed_at: new Date().toISOString()
               }
             })
             .eq("id", item.id);
@@ -238,13 +372,32 @@ async function processTracksBatch(): Promise<{
       } catch (itemError) {
         console.error(`Error processing item ${item.id}:`, itemError);
         
-        // Increment retry count and mark as error
+        // Determine if error is transient or permanent
+        const isTransient = itemError.message.includes("rate limit") || 
+                             itemError.message.includes("timeout") ||
+                             itemError.message.includes("network") ||
+                             itemError.message.includes("429") ||
+                             itemError.message.includes("503");
+        
+        // Increment retry count and mark appropriately
+        const shouldRetry = (item.retry_count || 0) < 5 && isTransient;
+        const backoffTime = calculateBackoff(item.retry_count || 0);
+        const retryAfter = new Date(Date.now() + backoffTime).toISOString();
+        
         await supabase
           .from("processing_items")
           .update({
-            status: "error",
+            status: shouldRetry ? "pending" : "error",
             retry_count: (item.retry_count || 0) + 1,
-            last_error: itemError.message
+            last_error: itemError.message,
+            metadata: {
+              ...item.metadata,
+              last_error: itemError.message,
+              last_error_at: new Date().toISOString(),
+              is_transient: isTransient,
+              retry_after: shouldRetry ? retryAfter : null,
+              backoff_ms: backoffTime
+            }
           })
           .eq("id", item.id);
         
@@ -259,7 +412,10 @@ async function processTracksBatch(): Promise<{
           p_item_type: item.item_type
         });
         
-        failedItems.push(item.id);
+        // Only count as failed if we've given up retrying
+        if (!shouldRetry) {
+          failedItems.push(item.id);
+        }
       }
     }
     
@@ -310,7 +466,8 @@ async function processTracksBatch(): Promise<{
       message: `Processed ${processedItems.length} items, failed ${failedItems.length} items, ${count || 'unknown'} items remaining`,
       batchId,
       processed: processedItems.length,
-      failed: failedItems.length
+      failed: failedItems.length,
+      status: allDone ? "completed" : "in_progress"
     };
   } catch (error) {
     console.error("Error processing tracks batch:", error);
@@ -326,7 +483,8 @@ async function processTracksBatch(): Promise<{
     
     return {
       success: false,
-      message: `Error processing tracks batch: ${error.message}`
+      message: `Error processing tracks batch: ${error.message}`,
+      status: "error"
     };
   }
 }
@@ -351,7 +509,8 @@ serve(async (req) => {
         result = {
           success: true,
           message: `Created a new tracks batch with ${limit} tracks`,
-          batchId
+          batchId,
+          status: "created"
         };
       } else {
         // Process a batch

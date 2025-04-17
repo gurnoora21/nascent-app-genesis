@@ -1,3 +1,4 @@
+
 import { Toast, ToastActionElement, ToastProps } from "@/components/ui/toast"
 import {
   useCallback,
@@ -156,6 +157,45 @@ function toast({ ...props }: Toast) {
   }
 }
 
+// Add pipeline-specific toast functions
+function pipelineError(title: string, description: string) {
+  return toast({
+    variant: "destructive",
+    title,
+    description,
+    duration: 5000,
+  });
+}
+
+function pipelineWarning(title: string, description: string) {
+  return toast({
+    variant: "default",
+    title,
+    description,
+    className: "bg-yellow-500",
+    duration: 4000,
+  });
+}
+
+function pipelineSuccess(title: string, description: string) {
+  return toast({
+    variant: "default",
+    title,
+    description,
+    className: "bg-green-500 text-white",
+    duration: 3000,
+  });
+}
+
+function pipelineInfo(title: string, description: string) {
+  return toast({
+    variant: "default",
+    title,
+    description,
+    duration: 3000,
+  });
+}
+
 function useToast() {
   const [state, setState] = useState<State>(memoryState)
 
@@ -172,8 +212,12 @@ function useToast() {
   return {
     ...state,
     toast,
+    pipelineError,
+    pipelineWarning,
+    pipelineSuccess,
+    pipelineInfo,
     dismiss: (toastId?: string) => dispatch({ type: "DISMISS_TOAST", toastId }),
   }
 }
 
-export { useToast, toast }
+export { useToast, toast, pipelineError, pipelineWarning, pipelineSuccess, pipelineInfo }
