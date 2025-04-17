@@ -1,7 +1,7 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
-import { v4 as uuidv4 } from "https://deno.land/std@0.177.0/uuid/mod.ts";
+import { v4 } from "https://deno.land/std@0.177.0/uuid/mod.ts";
 
 // CORS headers for browser access
 const corsHeaders = {
@@ -19,7 +19,7 @@ async function processBatch(batchType: string): Promise<{
 }> {
   try {
     // Generate a unique worker ID
-    const workerId = uuidv4();
+    const workerId = v4.generate();
     
     console.log(`Worker ${workerId} claiming a batch of type: ${batchType}`);
     
