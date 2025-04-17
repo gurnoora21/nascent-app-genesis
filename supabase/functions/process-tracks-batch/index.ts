@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
 
@@ -107,7 +106,6 @@ async function createTracksBatch(limit: number = 50, metadata?: Record<string, a
       console.log(`Created new identify_producers batch ${batchId}`);
     }
     
-    // FIX: Corrected query approach to avoid the "not.in.[object Object]" error
     // First, get the IDs of tracks that are already in processing items
     const { data: existingItemsData, error: existingItemsError } = await supabase
       .from("processing_items")
@@ -121,7 +119,6 @@ async function createTracksBatch(limit: number = 50, metadata?: Record<string, a
       throw existingItemsError;
     }
     
-    // Extract the item_ids into an array
     const existingItemIds = existingItemsData?.map(item => item.item_id) || [];
     
     // Get the IDs of tracks that already have producers
@@ -134,16 +131,15 @@ async function createTracksBatch(limit: number = 50, metadata?: Record<string, a
       throw trackProducersError;
     }
     
-    // Extract track_ids into an array
     const tracksWithProducers = trackProducersData?.map(item => item.track_id) || [];
     
-    // Now build the query with explicit filters instead of subqueries
+    // Build the query with explicit filters
     let query = supabase
       .from("tracks")
       .select("id, name, artist_id, popularity")
       .order("popularity", { ascending: false });
     
-    // Apply filtering only if arrays are non-empty
+    // Apply filtering for existing tracks and producers
     if (tracksWithProducers.length > 0) {
       query = query.not('id', 'in', tracksWithProducers);
     }
@@ -152,17 +148,34 @@ async function createTracksBatch(limit: number = 50, metadata?: Record<string, a
       query = query.not('id', 'in', existingItemIds);
     }
     
-    // Apply artist filter from metadata if provided
-    if (metadata?.artist_name) {
-      // Join with artists table to filter by artist name
+    // Apply artist filter from metadata
+    if (metadata?.artist_spotify_id) {
+      // Priority 1: Filter by Spotify ID if provided
       const { data: artistData, error: artistError } = await supabase
         .from("artists")
         .select("id")
-        .ilike("name", metadata.artist_name)
+        .eq("spotify_id", metadata.artist_spotify_id)
+        .single();
+      
+      if (!artistError && artistData) {
+        query = query.eq('artist_id', artistData.id);
+      } else {
+        console.error("Artist not found with Spotify ID:", metadata.artist_spotify_id);
+        throw new Error("Artist not found with provided Spotify ID");
+      }
+    } else if (metadata?.artist_name) {
+      // Fallback: Filter by exact artist name match
+      const { data: artistData, error: artistError } = await supabase
+        .from("artists")
+        .select("id")
+        .eq("name", metadata.artist_name)  // Using exact match instead of ilike
         .limit(1);
       
       if (!artistError && artistData && artistData.length > 0) {
         query = query.eq('artist_id', artistData[0].id);
+      } else {
+        console.error("Artist not found with name:", metadata.artist_name);
+        throw new Error("Artist not found with provided name");
       }
     }
     
