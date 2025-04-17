@@ -202,8 +202,11 @@ serve(async (req) => {
             completed_at: new Date().toISOString(),
           })
           .eq("id", batchId);
+
+        // Create next batch in pipeline for processing artists
+        await createNextBatchInPipeline(batchId, "process_artists");
           
-        console.log(`Discovery batch ${batchId} completed with ${totalDiscovered} artists discovered`);
+        console.log(`Discovery batch ${batchId} completed with ${totalDiscovered} artists discovered. Created process_artists batch.`);
       } catch (error) {
         console.error(`Error processing discovery batch ${batchId}:`, error);
         
@@ -263,3 +266,89 @@ serve(async (req) => {
     );
   }
 });
+
+// Create the next batch in the pipeline based on the current batch type
+async function createNextBatchInPipeline(parentBatchId: string, batchType: string): Promise<string | null> {
+  try {
+    // Get the parent batch for reference
+    const { data: parentBatch, error: batchError } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .eq("id", parentBatchId)
+      .single();
+    
+    if (batchError) {
+      console.error(`Error getting parent batch ${parentBatchId}:`, batchError);
+      return null;
+    }
+    
+    // Create the next batch in the pipeline
+    const { data: newBatch, error: createError } = await supabase
+      .from("processing_batches")
+      .insert({
+        batch_type: batchType,
+        status: "pending",
+        metadata: {
+          parent_batch_id: parentBatchId,
+          parent_batch_type: parentBatch.batch_type,
+        }
+      })
+      .select("id")
+      .single();
+    
+    if (createError) {
+      console.error(`Error creating next batch in pipeline:`, createError);
+      return null;
+    }
+    
+    console.log(`Created next batch in pipeline: ${batchType} with ID ${newBatch.id}`);
+    
+    // For process_artists batch, add all artists from parent batch as items to process
+    if (batchType === "process_artists") {
+      const { data: items, error: itemsError } = await supabase
+        .from("processing_items")
+        .select("item_id, priority")
+        .eq("batch_id", parentBatchId)
+        .eq("item_type", "artist");
+      
+      if (itemsError) {
+        console.error(`Error getting items from parent batch:`, itemsError);
+        return newBatch.id;
+      }
+      
+      if (items && items.length > 0) {
+        // Create new processing items for each artist
+        const newItems = items.map(item => ({
+          batch_id: newBatch.id,
+          item_type: "artist",
+          item_id: item.item_id,
+          status: "pending",
+          priority: item.priority
+        }));
+        
+        const { error: insertError } = await supabase
+          .from("processing_items")
+          .insert(newItems);
+        
+        if (insertError) {
+          console.error(`Error creating items for next batch:`, insertError);
+        } else {
+          console.log(`Added ${newItems.length} artists to process_artists batch ${newBatch.id}`);
+          
+          // Update the batch with the total number of items
+          await supabase
+            .from("processing_batches")
+            .update({
+              items_total: newItems.length
+            })
+            .eq("id", newBatch.id);
+        }
+      }
+    }
+    
+    return newBatch.id;
+  } catch (error) {
+    console.error(`Error creating next batch in pipeline:`, error);
+    return null;
+  }
+}

@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
 
@@ -10,6 +11,47 @@ const corsHeaders = {
 // Create a new batch for processing tracks
 async function createTracksBatch(limit: number = 50): Promise<string> {
   try {
+    // First, check if there's an existing batch of type identify_producers
+    const { data: existingBatches, error: batchCheckError } = await supabase
+      .from("processing_batches")
+      .select("id")
+      .eq("batch_type", "identify_producers")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true })
+      .limit(1);
+    
+    if (batchCheckError) {
+      console.error("Error checking for existing batches:", batchCheckError);
+      throw batchCheckError;
+    }
+    
+    let batchId;
+    
+    if (existingBatches && existingBatches.length > 0) {
+      // Use existing batch
+      batchId = existingBatches[0].id;
+      console.log(`Using existing identify_producers batch ${batchId}`);
+    } else {
+      // Create a new batch
+      const { data: newBatch, error: batchError } = await supabase
+        .from("processing_batches")
+        .insert({
+          batch_type: "identify_producers",
+          status: "pending",
+          metadata: { limit }
+        })
+        .select("id")
+        .single();
+      
+      if (batchError) {
+        console.error("Error creating tracks batch:", batchError);
+        throw batchError;
+      }
+      
+      batchId = newBatch.id;
+      console.log(`Created new identify_producers batch ${batchId}`);
+    }
+    
     // Get tracks that don't have producers yet
     const { data: tracks, error: tracksError } = await supabase
       .from("tracks")
@@ -26,26 +68,9 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       throw new Error("No tracks found without producers");
     }
     
-    // Create a new batch
-    const { data: batch, error: batchError } = await supabase
-      .from("processing_batches")
-      .insert({
-        batch_type: "identify_producers",
-        status: "pending",
-        items_total: tracks.length,
-        metadata: { limit }
-      })
-      .select("id")
-      .single();
-    
-    if (batchError) {
-      console.error("Error creating tracks batch:", batchError);
-      throw batchError;
-    }
-    
     // Add tracks to the batch
     const batchItems = tracks.map((track) => ({
-      batch_id: batch.id,
+      batch_id: batchId,
       item_type: "track",
       item_id: track.id,
       status: "pending"
@@ -60,7 +85,17 @@ async function createTracksBatch(limit: number = 50): Promise<string> {
       throw itemsError;
     }
     
-    return batch.id;
+    // Update batch with item count
+    await supabase
+      .from("processing_batches")
+      .update({
+        items_total: batchItems.length
+      })
+      .eq("id", batchId);
+    
+    console.log(`Added ${batchItems.length} tracks to batch ${batchId}`);
+    
+    return batchId;
   } catch (error) {
     console.error("Error creating tracks batch:", error);
     throw error;
@@ -76,7 +111,7 @@ async function processTracksBatch(): Promise<{
   failed?: number;
 }> {
   try {
-    // Generate a unique worker ID - Using crypto.randomUUID() for consistency
+    // Generate a unique worker ID
     const workerId = crypto.randomUUID();
     
     console.log(`Worker ${workerId} claiming a batch of type: identify_producers`);
@@ -252,6 +287,23 @@ async function processTracksBatch(): Promise<{
         p_status: allDone ? "completed" : "processing"
       }
     );
+    
+    // Update batch with progress
+    const { data: currentBatch, error: batchError } = await supabase
+      .from("processing_batches")
+      .select("items_total, items_processed, items_failed")
+      .eq("id", batchId)
+      .single();
+    
+    if (!batchError) {
+      await supabase
+        .from("processing_batches")
+        .update({
+          items_processed: (currentBatch.items_processed || 0) + processedItems.length,
+          items_failed: (currentBatch.items_failed || 0) + failedItems.length
+        })
+        .eq("id", batchId);
+    }
     
     return {
       success: true,
