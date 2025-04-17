@@ -228,6 +228,185 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
   }
 }
 
+// New function to process all artists in a batch
+async function processBatch(batchId: string): Promise<{
+  success: boolean, 
+  message: string, 
+  processed: number,
+  failed: number,
+  data?: any
+}> {
+  try {
+    console.log(`Processing all artists in batch: ${batchId}`);
+    
+    // Get all pending artist items from the batch
+    const { data: items, error: itemsError } = await supabase
+      .from("processing_items")
+      .select("*")
+      .eq("batch_id", batchId)
+      .eq("status", "pending")
+      .eq("item_type", "artist");
+    
+    if (itemsError) {
+      throw new Error(`Failed to get items from batch: ${itemsError.message}`);
+    }
+    
+    if (!items || items.length === 0) {
+      return {
+        success: true,
+        message: "No pending artist items found in the batch",
+        processed: 0,
+        failed: 0
+      };
+    }
+    
+    console.log(`Found ${items.length} pending artists to process in batch ${batchId}`);
+    
+    const processed = [];
+    const failed = [];
+    
+    // Process each artist
+    for (const item of items) {
+      try {
+        console.log(`Processing item ${item.id}: artist with Spotify ID ${item.item_id}`);
+        
+        // Process the artist
+        const result = await processArtist(item.item_id);
+        
+        if (result.success) {
+          // Mark item as processed with completed status
+          await supabase
+            .from("processing_items")
+            .update({
+              status: "completed",
+              metadata: {
+                ...item.metadata,
+                result
+              }
+            })
+            .eq("id", item.id);
+          
+          processed.push(item.id);
+        } else {
+          // Mark as error
+          await supabase
+            .from("processing_items")
+            .update({
+              status: "error",
+              retry_count: (item.retry_count || 0) + 1,
+              last_error: result.message
+            })
+            .eq("id", item.id);
+          
+          failed.push(item.id);
+        }
+      } catch (itemError) {
+        console.error(`Error processing item ${item.id}:`, itemError);
+        
+        // Mark as error
+        await supabase
+          .from("processing_items")
+          .update({
+            status: "error",
+            retry_count: (item.retry_count || 0) + 1,
+            last_error: itemError.message
+          })
+          .eq("id", item.id);
+        
+        // Log error
+        await supabase.rpc("log_error", {
+          p_error_type: "processing",
+          p_source: "process_artist",
+          p_message: `Error processing artist`,
+          p_stack_trace: itemError.stack || "",
+          p_context: item,
+          p_item_id: item.item_id,
+          p_item_type: item.item_type
+        });
+        
+        failed.push(item.id);
+      }
+    }
+    
+    // Update the batch with accurate progress
+    const { count: totalItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId);
+    
+    const { count: completedItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "completed");
+    
+    const { count: errorItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "error");
+    
+    await supabase
+      .from("processing_batches")
+      .update({
+        items_total: totalItems || 0,
+        items_processed: completedItems || 0,
+        items_failed: errorItems || 0,
+      })
+      .eq("id", batchId);
+    
+    // Check if all items are processed
+    const { count: pendingItems } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId)
+      .eq("status", "pending");
+    
+    // If no pending items, mark batch as completed
+    if (pendingItems === 0) {
+      await supabase.rpc(
+        "release_processing_batch",
+        {
+          p_batch_id: batchId,
+          p_worker_id: crypto.randomUUID(), // Using a random UUID as worker ID
+          p_status: "completed"
+        }
+      );
+    }
+    
+    return {
+      success: true,
+      message: `Processed ${processed.length} artists, failed ${failed.length} artists`,
+      processed: processed.length,
+      failed: failed.length,
+      data: {
+        processedItems: processed,
+        failedItems: failed
+      }
+    };
+  } catch (error) {
+    console.error(`Error processing batch ${batchId}:`, error);
+    
+    // Log error to our database
+    await supabase.rpc("log_error", {
+      p_error_type: "processing",
+      p_source: "process_artist",
+      p_message: `Error processing batch`,
+      p_stack_trace: error.stack || "",
+      p_context: { batchId },
+      p_item_id: batchId,
+      p_item_type: "batch"
+    });
+    
+    return {
+      success: false,
+      message: `Error processing batch: ${error.message}`,
+      processed: 0,
+      failed: 0
+    };
+  }
+}
+
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
@@ -236,13 +415,43 @@ serve(async (req) => {
 
   try {
     // Parse request body
-    const { spotifyId } = await req.json();
+    const requestBody = await req.json();
+    const { spotifyId, batchId } = requestBody;
     
-    if (!spotifyId) {
+    // Check if we're processing a batch or a single artist
+    if (batchId) {
+      // Process all artists in a batch
+      const result = await processBatch(batchId);
+      
+      return new Response(
+        JSON.stringify(result),
+        {
+          status: result.success ? 200 : 500,
+          headers: {
+            "Content-Type": "application/json",
+            ...corsHeaders,
+          },
+        }
+      );
+    } else if (spotifyId) {
+      // Process a single artist (maintaining backward compatibility)
+      const result = await processArtist(spotifyId);
+      
+      return new Response(
+        JSON.stringify(result),
+        {
+          status: result.success ? 200 : 500,
+          headers: {
+            "Content-Type": "application/json",
+            ...corsHeaders,
+          },
+        }
+      );
+    } else {
       return new Response(
         JSON.stringify({
           success: false,
-          error: "spotifyId is required",
+          error: "Either spotifyId or batchId is required",
         }),
         {
           status: 400,
@@ -253,19 +462,6 @@ serve(async (req) => {
         }
       );
     }
-
-    const result = await processArtist(spotifyId);
-    
-    return new Response(
-      JSON.stringify(result),
-      {
-        status: result.success ? 200 : 500,
-        headers: {
-          "Content-Type": "application/json",
-          ...corsHeaders,
-        },
-      }
-    );
   } catch (error) {
     console.error("Error handling process-artist request:", error);
     

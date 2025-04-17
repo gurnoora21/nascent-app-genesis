@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
 
@@ -88,93 +87,53 @@ async function processBatch(batchType: string): Promise<{
     const processedItems: string[] = [];
     const failedItems: string[] = [];
     
-    // Process each item in the batch based on batch type
-    for (const item of items) {
-      try {
-        console.log(`Processing item ${item.id}: ${item.item_type}/${item.item_id}`);
-        
-        // Process based on batch type and item type
-        if (batchType === "process_artists" && item.item_type === "artist") {
-          // Call the process-artist function
-          const response = await fetch(
-            `https://nsxxzhhbcwzatvlulfyp.supabase.co/functions/v1/process-artist`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`
-              },
-              body: JSON.stringify({ spotifyId: item.item_id })
-            }
-          );
-          
-          const result = await response.json();
-          
-          if (!result.success) {
-            throw new Error(result.message || "Unknown error processing artist");
-          }
-          
-          // FIX 2: Mark item as processed with completed status
-          await supabase
-            .from("processing_items")
-            .update({
-              status: "completed",  // Explicitly set to completed
-              metadata: {
-                ...item.metadata,
-                result
-              }
-            })
-            .eq("id", item.id);
-          
-          processedItems.push(item.id);
-        } else {
-          console.warn(`Unknown batch type or item type combination: ${batchType}/${item.item_type}`);
-          
-          // Mark as completed anyway to avoid getting stuck
-          await supabase
-            .from("processing_items")
-            .update({
-              status: "completed",
-              metadata: {
-                ...item.metadata,
-                warning: `Unknown batch type or item type combination: ${batchType}/${item.item_type}`
-              }
-            })
-            .eq("id", item.id);
-          
-          processedItems.push(item.id);
+    // Process based on batch type
+    if (batchType === "process_artists") {
+      // Instead of processing artists one by one, call the updated process-artist function with batchId
+      const response = await fetch(
+        `https://nsxxzhhbcwzatvlulfyp.supabase.co/functions/v1/process-artist`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`
+          },
+          body: JSON.stringify({ batchId })
         }
-      } catch (itemError) {
-        console.error(`Error processing item ${item.id}:`, itemError);
-        
-        // Increment retry count and mark as error
+      );
+      
+      const result = await response.json();
+      
+      if (!result.success) {
+        throw new Error(result.message || "Unknown error processing artist batch");
+      }
+      
+      // The process-artist function now handles item status updates, so we just need to update our counts
+      processedItems.push(...(result.data?.processedItems || []));
+      failedItems.push(...(result.data?.failedItems || []));
+    } else {
+      console.warn(`Unknown batch type: ${batchType}`);
+      
+      // Mark all items as completed anyway to avoid getting stuck
+      for (const item of items) {
         await supabase
           .from("processing_items")
           .update({
-            status: "error",
-            retry_count: (item.retry_count || 0) + 1,
-            last_error: itemError.message
+            status: "completed",
+            metadata: {
+              ...item.metadata,
+              warning: `Unknown batch type: ${batchType}`
+            }
           })
           .eq("id", item.id);
         
-        // Log error
-        await supabase.rpc("log_error", {
-          p_error_type: "processing",
-          p_source: "process_batch",
-          p_message: `Error processing item ${item.item_type}/${item.item_id}`,
-          p_stack_trace: itemError.stack || "",
-          p_context: item,
-          p_item_id: item.item_id,
-          p_item_type: item.item_type
-        });
-        
-        failedItems.push(item.id);
+        processedItems.push(item.id);
       }
     }
     
     console.log(`Batch ${batchId} processing complete. Processed: ${processedItems.length}, Failed: ${failedItems.length}`);
     
-    // FIX 1: Get accurate counts from the database for this batch
+    // Get accurate counts from the database for this batch
     const { count: totalItems, error: countError } = await supabase
       .from("processing_items")
       .select("*", { count: "exact", head: true })
