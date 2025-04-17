@@ -377,6 +377,10 @@ export type Database = {
         }
         Returns: string
       }
+      clone_batch: {
+        Args: { p_batch_id: string; p_include_only_failed?: boolean }
+        Returns: string
+      }
       find_producer_duplicates: {
         Args: { threshold?: number }
         Returns: {
@@ -430,6 +434,14 @@ export type Database = {
           p_status: Database["public"]["Enums"]["processing_status"]
         }
         Returns: boolean
+      }
+      reset_batch: {
+        Args: { p_batch_id: string }
+        Returns: boolean
+      }
+      reset_failed_items: {
+        Args: { p_batch_id: string }
+        Returns: number
       }
       set_limit: {
         Args: { "": number }

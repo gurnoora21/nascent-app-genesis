@@ -317,22 +317,23 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
     // Add appropriate items based on the batch type
     if (nextBatchType === "collect_tracks") {
       // For collect_tracks, we add all processed artists from the process_artists batch
-      const { data: processedArtists, error: artistsError } = await supabase
-        .from("artists")
-        .select("id")
-        .order("last_processed_at", { ascending: false })
-        .limit(50); // Limit to a reasonable number
+      const { data: completedItems, error: itemsError } = await supabase
+        .from("processing_items")
+        .select("item_id, priority")
+        .eq("batch_id", batchId)
+        .eq("item_type", "artist")
+        .eq("status", "completed");
       
-      if (artistsError) {
-        console.error(`Error getting processed artists:`, artistsError);
-      } else if (processedArtists && processedArtists.length > 0) {
+      if (itemsError) {
+        console.error(`Error getting completed items from batch:`, itemsError);
+      } else if (completedItems && completedItems.length > 0) {
         // Create new processing items for each artist
-        const newItems = processedArtists.map(artist => ({
+        const newItems = completedItems.map(item => ({
           batch_id: newBatch.id,
           item_type: "artist",
-          item_id: artist.id,
+          item_id: item.item_id,
           status: "pending",
-          priority: 5
+          priority: item.priority
         }));
         
         const { error: insertError } = await supabase
@@ -357,8 +358,8 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
       // For identify_producers, we create a batch but leave item creation to process-tracks-batch
       console.log(`identify_producers batch created, but items will be added by process-tracks-batch`);
     } else if (nextBatchType === "process_artists") {
-      // For process_artists, add items from discover_artists batch
-      const { data: items, error: itemsError } = await supabase
+      // For process_artists, add completed items from discover_artists batch
+      const { data: completedItems, error: itemsError } = await supabase
         .from("processing_items")
         .select("item_id, priority")
         .eq("batch_id", batchId)
@@ -367,9 +368,9 @@ async function createNextBatchInPipeline(batchId: string): Promise<string | null
       
       if (itemsError) {
         console.error(`Error getting items from parent batch:`, itemsError);
-      } else if (items && items.length > 0) {
+      } else if (completedItems && completedItems.length > 0) {
         // Create new processing items for each artist
-        const newItems = items.map(item => ({
+        const newItems = completedItems.map(item => ({
           batch_id: newBatch.id,
           item_type: "artist",
           item_id: item.item_id,
