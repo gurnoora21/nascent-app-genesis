@@ -20,56 +20,54 @@ function chunkArray<T>(array: T[], chunkSize: number): T[][] {
 
 /**
  * Enhanced process artist albums helper function with improved pagination
+ * Modified to better handle appears_on and compilation albums
  */
 async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Promise<any[]> {
   let allAlbums = [];
   let offset = 0;
-  const limit = 50; // Increased to maximum allowed by Spotify API
+  const limit = 50; // Maximum allowed by Spotify API
   let hasMore = true;
   let totalAlbums = 0;
   let retryCount = 0;
   const maxRetries = 3;
   let failedBatches = 0;
-
-  console.log(`Fetching albums for artist ${spotifyId} in chunks of ${limit} (including appears_on and compilations)`);
   
-  while (hasMore && failedBatches < 5) { // Added limit on failed batches
+  // First fetch the artist's own albums (album, single)
+  console.log(`Fetching primary albums for artist ${spotifyId} in chunks of ${limit}`);
+  
+  // Process albums - artist's own albums
+  while (hasMore && failedBatches < 5) {
     try {
-      // Use retryOperation for album fetching with backoff
       const albumsResponse = await RetryHelper.retryOperation(
         async () => spotify.getArtistAlbums(
           spotifyId, 
           limit, 
           offset, 
-          "album,single,compilation,appears_on"
+          "album,single" // Only get the artist's own albums, not appears_on or compilations
         ),
-        3, // 3 retries
-        2000, // 2s initial delay
-        `Fetch albums batch at offset ${offset}`
+        3,
+        2000,
+        `Fetch primary albums batch at offset ${offset}`
       );
       
-      // Enhanced validation of response
       if (!albumsResponse) {
         console.error(`Empty response received for albums at offset ${offset}`);
         failedBatches++;
-        offset += limit; // Still increment to try next batch
+        offset += limit;
         continue;
       }
       
-      // Validate response has items array
       if (!Array.isArray(albumsResponse?.items) || albumsResponse.items.length === 0) {
-        console.log(`No more albums found at offset ${offset}`);
+        console.log(`No more primary albums found at offset ${offset}`);
         hasMore = false;
         break;
       }
       
-      // Update total count if it's the first batch
       if (offset === 0 && albumsResponse.total != null) {
         totalAlbums = albumsResponse.total;
-        console.log(`Artist has ${totalAlbums} total albums to process`);
+        console.log(`Artist has ${totalAlbums} total primary albums to process`);
       }
       
-      // Add retrieved albums to our collection with better filtering
       const validAlbums = albumsResponse.items.filter(item => {
         if (!item || !item.id) {
           console.warn(`Invalid album entry found in response`);
@@ -78,7 +76,6 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         return true;
       });
       
-      // Log duplicate detection during collection phase
       const existingIds = new Set(allAlbums.map(a => a.id));
       const newAlbums = validAlbums.filter(album => !existingIds.has(album.id));
       const duplicates = validAlbums.length - newAlbums.length;
@@ -87,6 +84,11 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         console.log(`Found ${duplicates} duplicate albums in this batch that were filtered out`);
       }
       
+      // Add primary album flag to indicate this is the artist's own album
+      newAlbums.forEach(album => {
+        album.is_primary_artist_album = true;
+      });
+      
       allAlbums.push(...newAlbums);
       
       if (validAlbums.length < albumsResponse.items.length) {
@@ -94,26 +96,23 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
       }
       
       offset += limit;
-      console.log(`Fetched ${allAlbums.length}/${totalAlbums} albums so far (offset: ${offset})`);
+      console.log(`Fetched ${allAlbums.length}/${totalAlbums} primary albums so far (offset: ${offset})`);
       
-      // Enhanced check if there are more albums to fetch
       hasMore = validAlbums.length > 0 && 
                (albumsResponse.next || offset < totalAlbums);
       
-      // Reset retry counter on success
       retryCount = 0;
     } catch (albumFetchError) {
-      console.error(`Error fetching albums at offset ${offset}:`, albumFetchError);
+      console.error(`Error fetching primary albums at offset ${offset}:`, albumFetchError);
       
       retryCount++;
       if (retryCount >= maxRetries) {
         console.warn(`Max retries (${maxRetries}) reached for offset ${offset}, moving to next batch`);
-        offset += limit; // Skip this batch after multiple failures
+        offset += limit;
         retryCount = 0;
         failedBatches++;
       }
       
-      // Log the error but continue with the albums we already have
       await supabase.rpc("log_error", {
         p_error_type: "processing",
         p_source: "process_artist",
@@ -124,7 +123,103 @@ async function fetchArtistAlbums(spotify: SpotifyClient, spotifyId: string): Pro
         p_item_type: "artist"
       });
       
-      // Short delay before retry or continuing
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+  
+  // Now fetch appears_on and compilation albums separately
+  console.log(`Fetching appears_on and compilation albums for artist ${spotifyId}`);
+  
+  offset = 0;
+  hasMore = true;
+  totalAlbums = 0;
+  retryCount = 0;
+  failedBatches = 0;
+  
+  // Process albums - appears_on and compilations
+  while (hasMore && failedBatches < 5) {
+    try {
+      const albumsResponse = await RetryHelper.retryOperation(
+        async () => spotify.getArtistAlbums(
+          spotifyId, 
+          limit, 
+          offset, 
+          "appears_on,compilation" // Only get albums where artist appears on or compilations
+        ),
+        3,
+        2000,
+        `Fetch appears_on albums batch at offset ${offset}`
+      );
+      
+      if (!albumsResponse) {
+        console.error(`Empty response received for appears_on albums at offset ${offset}`);
+        failedBatches++;
+        offset += limit;
+        continue;
+      }
+      
+      if (!Array.isArray(albumsResponse?.items) || albumsResponse.items.length === 0) {
+        console.log(`No more appears_on albums found at offset ${offset}`);
+        hasMore = false;
+        break;
+      }
+      
+      if (offset === 0 && albumsResponse.total != null) {
+        totalAlbums = albumsResponse.total;
+        console.log(`Artist appears on ${totalAlbums} total albums to process`);
+      }
+      
+      const validAlbums = albumsResponse.items.filter(item => {
+        if (!item || !item.id) {
+          console.warn(`Invalid album entry found in response`);
+          return false;
+        }
+        return true;
+      });
+      
+      const existingIds = new Set(allAlbums.map(a => a.id));
+      const newAlbums = validAlbums.filter(album => !existingIds.has(album.id));
+      const duplicates = validAlbums.length - newAlbums.length;
+      
+      if (duplicates > 0) {
+        console.log(`Found ${duplicates} duplicate appears_on albums that were filtered out`);
+      }
+      
+      // Add flag to indicate this is not the artist's own album
+      newAlbums.forEach(album => {
+        album.is_primary_artist_album = false;
+      });
+      
+      allAlbums.push(...newAlbums);
+      
+      offset += limit;
+      console.log(`Fetched ${allAlbums.length - totalAlbums}/${totalAlbums} appears_on albums so far (offset: ${offset})`);
+      
+      hasMore = validAlbums.length > 0 && 
+               (albumsResponse.next || offset < totalAlbums);
+      
+      retryCount = 0;
+    } catch (albumFetchError) {
+      console.error(`Error fetching appears_on albums at offset ${offset}:`, albumFetchError);
+      
+      retryCount++;
+      if (retryCount >= maxRetries) {
+        console.warn(`Max retries (${maxRetries}) reached for offset ${offset}, moving to next batch`);
+        offset += limit;
+        retryCount = 0;
+        failedBatches++;
+      }
+      
+      await supabase.rpc("log_error", {
+        p_error_type: "processing",
+        p_source: "process_artist",
+        p_message: `Error fetching appears_on albums batch`,
+        p_stack_trace: albumFetchError.stack || "",
+        p_context: { spotifyId, offset, limit, retryCount, failedBatches },
+        p_item_id: spotifyId,
+        p_item_type: "artist"
+      });
+      
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
@@ -358,7 +453,7 @@ async function getOrCreateArtist(spotify: SpotifyClient, spotifyId: string): Pro
 }
 
 /**
- * Enhanced process tracks from an album function with better deduplication
+ * Enhanced process tracks from an album function with better handling of featured artists
  */
 async function processAlbumTracks(
   spotify: SpotifyClient, 
@@ -370,6 +465,8 @@ async function processAlbumTracks(
     total: number;
     new: number;
     duplicates: number;
+    primary: number;
+    features: number;
     byAlbumType: Record<string, number>;
   }
 ): Promise<any[]> {
@@ -394,6 +491,17 @@ async function processAlbumTracks(
     for (const track of albumTracks) {
       if (!track || !track.id) {
         console.warn(`Invalid track data in album ${album.name}`);
+        continue;
+      }
+      
+      // IMPORTANT: Only process tracks where the artist is involved
+      // This is the key change to only get tracks featuring the artist on other albums
+      const artistInvolved = track.artists && Array.isArray(track.artists) && 
+                            track.artists.some(artist => artist.id === artistRecord.spotify_id);
+      
+      // Skip tracks that don't involve our artist if this is not the artist's primary album
+      if (!album.is_primary_artist_album && !artistInvolved) {
+        console.log(`Skipping track "${track.name}" from album "${album.name}" - artist not involved`);
         continue;
       }
       
@@ -455,7 +563,8 @@ async function processAlbumTracks(
                 type: album.album_type,
                 total_tracks: album.total_tracks,
                 release_date: album.release_date,
-                release_date_precision: album.release_date_precision
+                release_date_precision: album.release_date_precision,
+                is_primary_artist_album: album.is_primary_artist_album || false
               }
             }
           };
@@ -615,6 +724,8 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       total: 0,
       new: 0,
       duplicates: 0,
+      primary: 0,
+      features: 0,
       byAlbumType: {
         album: 0,
         single: 0,
@@ -658,6 +769,13 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
           
           if (tracks.length > 0) {
             processedTracks.push(...tracks);
+            
+            // Count primary vs. feature tracks
+            if (album.is_primary_artist_album) {
+              trackStats.primary += tracks.length;
+            } else {
+              trackStats.features += tracks.length;
+            }
           }
           
           successfulAlbums++;
@@ -686,9 +804,18 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       console.log(`Processed ${processedTrackIds.size} tracks so far (${i + 1}/${albumChunks.length} album chunks)`);
       console.log(`Album processing stats: ${successfulAlbums} successful, ${failedAlbums} failed`);
       
+      // Add more detailed tracking progress
+      console.log(`Track breakdown - Primary: ${trackStats.primary}, Features: ${trackStats.features}`);
+      
       // Prevent long-running function timeouts by adding a small delay
       if (i < albumChunks.length - 1) {
         await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      // If we've already gathered a large number of tracks, break to avoid timeout
+      if (processedTrackIds.size > 10000) {
+        console.warn(`Reached large track count (${processedTrackIds.size}), stopping album processing to avoid timeout`);
+        break;
       }
     }
 
@@ -705,6 +832,8 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
     console.log(`Total unique tracks: ${processedTrackIds.size}`);
     console.log(`Tracks stored in database: ${processedTracks.length}`);
     console.log(`Albums processed: ${successfulAlbums} successful, ${failedAlbums} failed`);
+    console.log(`Primary artist tracks: ${trackStats.primary}`);
+    console.log(`Feature tracks: ${trackStats.features}`);
     console.log(`Tracks by album type: ${JSON.stringify(trackStats.byAlbumType, null, 2)}`);
     console.log(`Total tracks seen: ${trackStats.total} (${trackStats.new} new, ${trackStats.duplicates} duplicates)`);
     
@@ -726,40 +855,54 @@ async function processArtist(spotifyId: string): Promise<{success: boolean, mess
       console.error(`Error verifying track count in database:`, verificationError);
     }
 
+    // Prepare a reduced response to avoid response size limits
+    const summaryData = {
+      artist: artistRecord.name,
+      artistId: artistRecord.id,
+      tracksProcessed: processedTrackIds.size,
+      tracksStored: processedTracks.length,
+      albumsProcessed: {
+        total: allAlbums.length,
+        successful: successfulAlbums,
+        failed: failedAlbums
+      },
+      trackStats: {
+        primary: trackStats.primary,
+        features: trackStats.features,
+        byAlbumType: trackStats.byAlbumType,
+        total: trackStats.total,
+        new: trackStats.new,
+        duplicates: trackStats.duplicates
+      }
+      // Do NOT include track details to avoid response size issues
+    };
+
     return {
       success: true,
       message: `Successfully processed artist ${artistRecord.name} with ${processedTrackIds.size} unique tracks`,
-      data: {
-        artist: artistRecord.name,
-        artistId: artistRecord.id,
-        tracksProcessed: processedTrackIds.size,
-        tracksStored: processedTracks.length,
-        albumsProcessed: {
-          total: allAlbums.length,
-          successful: successfulAlbums,
-          failed: failedAlbums
-        },
-        trackStats: trackStats,
-        tracksDetails: processedTracks.slice(0, 10) // Return a sample to avoid overloading the response
-      }
+      data: summaryData
     };
   } catch (error) {
     console.error(`Error processing artist ${spotifyId}:`, error);
     
     // Log error to our database
-    await supabase.rpc("log_error", {
-      p_error_type: "processing",
-      p_source: "process_artist",
-      p_message: `Error processing artist`,
-      p_stack_trace: error.stack || "",
-      p_context: { spotifyId },
-      p_item_id: spotifyId,
-      p_item_type: "artist"
-    });
+    try {
+      await supabase.rpc("log_error", {
+        p_error_type: "processing",
+        p_source: "process_artist",
+        p_message: `Error processing artist`,
+        p_stack_trace: error.stack || "",
+        p_context: { spotifyId },
+        p_item_id: spotifyId,
+        p_item_type: "artist"
+      });
+    } catch (logError) {
+      console.error("Failed to log error to database:", logError);
+    }
     
     return {
       success: false,
-      message: `Error processing artist: ${error.message}`
+      message: `Error processing artist: ${error instanceof Error ? error.message : "Unknown error"}`
     };
   }
 }
@@ -917,15 +1060,19 @@ async function processBatch(batchId: string): Promise<{
     console.error(`Error processing batch ${batchId}:`, error);
     
     // Log error to our database
-    await supabase.rpc("log_error", {
-      p_error_type: "processing",
-      p_source: "process_artist",
-      p_message: `Error processing batch`,
-      p_stack_trace: error.stack || "",
-      p_context: { batchId },
-      p_item_id: batchId,
-      p_item_type: "batch"
-    });
+    try {
+      await supabase.rpc("log_error", {
+        p_error_type: "processing",
+        p_source: "process_artist",
+        p_message: `Error processing batch`,
+        p_stack_trace: error.stack || "",
+        p_context: { batchId },
+        p_item_id: batchId,
+        p_item_type: "batch"
+      });
+    } catch (logError) {
+      console.error("Error logging to database:", logError);
+    }
     
     return {
       success: false,
@@ -1001,8 +1148,22 @@ serve(async (req) => {
       // Process a single artist (maintaining backward compatibility)
       const result = await processArtist(spotifyId);
       
+      // Ensure we return a valid JSON response with a reduced size
+      const safeResponse = {
+        success: result.success,
+        message: result.message,
+        data: result.data ? {
+          artist: result.data.artist,
+          artistId: result.data.artistId,
+          tracksProcessed: result.data.tracksProcessed,
+          tracksStored: result.data.tracksStored,
+          trackStats: result.data.trackStats,
+          albumsProcessed: result.data.albumsProcessed
+        } : null
+      };
+      
       return new Response(
-        JSON.stringify(result),
+        JSON.stringify(safeResponse),
         {
           status: result.success ? 200 : 500,
           headers: {
@@ -1035,19 +1196,19 @@ serve(async (req) => {
         p_error_type: "endpoint",
         p_source: "process_artist",
         p_message: "Error handling process-artist request",
-        p_stack_trace: error.stack || "",
-        p_context: { error: error.message },
+        p_stack_trace: error instanceof Error ? error.stack : "",
+        p_context: { error: error instanceof Error ? error.message : String(error) },
       });
     } catch (logError) {
       console.error("Error logging to database:", logError);
     }
 
-    // Ensure we always return a properly formatted JSON response
+    // Ensure we always return a properly formatted JSON response with a small payload
     return new Response(
       JSON.stringify({
         success: false,
         error: error instanceof Error ? error.message : "Unknown error occurred",
-        errorDetails: error instanceof Error ? error.stack : null,
+        errorType: error instanceof Error ? error.constructor.name : typeof error
       }),
       {
         status: 500,
