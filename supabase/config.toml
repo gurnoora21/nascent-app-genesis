@@ -15,3 +15,6 @@ verify_jwt = false
 
 [functions.process-tracks-batch]
 verify_jwt = false
+
+[functions.test-pipeline]
+verify_jwt = false
