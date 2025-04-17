@@ -8,28 +8,81 @@ const corsHeaders = {
 };
 
 // Process an artist's albums and tracks
-async function processArtist(artistId: string): Promise<{
+async function processArtist(artistIdentifier: string): Promise<{
   success: boolean;
   message: string;
   processedAlbums?: number;
 }> {
   try {
     const spotify = new SpotifyClient();
+    let artist;
     
-    // Get artist details from our database
-    const { data: artist, error: artistError } = await supabase
-      .from("artists")
-      .select("id, name, spotify_id")
-      .eq("id", artistId)
-      .single();
+    // Check if it's a UUID or a Spotify ID
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(artistIdentifier);
     
-    if (artistError) {
-      console.error(`Error getting artist ${artistId}:`, artistError);
-      throw artistError;
+    if (isUUID) {
+      // Get artist details from our database using UUID
+      const { data: foundArtist, error: artistError } = await supabase
+        .from("artists")
+        .select("id, name, spotify_id")
+        .eq("id", artistIdentifier)
+        .single();
+      
+      if (artistError) {
+        console.error(`Error getting artist ${artistIdentifier}:`, artistError);
+        throw artistError;
+      }
+      
+      artist = foundArtist;
+    } else {
+      // It's a Spotify ID, try to find the artist by spotify_id
+      const { data: foundArtist, error: artistError } = await supabase
+        .from("artists")
+        .select("id, name, spotify_id")
+        .eq("spotify_id", artistIdentifier)
+        .single();
+      
+      if (artistError) {
+        // Artist doesn't exist yet, create it first
+        console.log(`Artist with Spotify ID ${artistIdentifier} not found. Creating new entry.`);
+        
+        // Get artist info from Spotify
+        const spotifyArtist = await spotify.getArtist(artistIdentifier);
+        
+        if (!spotifyArtist || !spotifyArtist.id) {
+          throw new Error(`Could not find artist with Spotify ID ${artistIdentifier}`);
+        }
+        
+        // Insert the artist into our database
+        const { data: newArtist, error: insertError } = await supabase
+          .from("artists")
+          .insert({
+            name: spotifyArtist.name,
+            spotify_id: spotifyArtist.id,
+            popularity: spotifyArtist.popularity,
+            genres: spotifyArtist.genres,
+            image_url: spotifyArtist.images?.[0]?.url,
+            spotify_url: spotifyArtist.external_urls?.spotify,
+            metadata: {
+              spotify: spotifyArtist
+            }
+          })
+          .select("id, name, spotify_id")
+          .single();
+        
+        if (insertError) {
+          console.error(`Error creating artist with Spotify ID ${artistIdentifier}:`, insertError);
+          throw insertError;
+        }
+        
+        artist = newArtist;
+      } else {
+        artist = foundArtist;
+      }
     }
     
     if (!artist.spotify_id) {
-      throw new Error(`No Spotify ID found for artist ${artistId}`);
+      throw new Error(`No Spotify ID found for artist ${artist.id}`);
     }
 
     console.log(`Processing artist: ${artist.name} (${artist.spotify_id})`);
@@ -127,7 +180,7 @@ async function processArtist(artistId: string): Promise<{
       processedAlbums: totalProcessed
     };
   } catch (error) {
-    console.error(`Error processing artist ${artistId}:`, error);
+    console.error(`Error processing artist ${artistIdentifier}:`, error);
     
     // Log error to our database
     await supabase.rpc("log_error", {
@@ -135,8 +188,8 @@ async function processArtist(artistId: string): Promise<{
       p_source: "process_artist",
       p_message: `Error processing artist`,
       p_stack_trace: error.stack || "",
-      p_context: { artistId },
-      p_item_id: artistId,
+      p_context: { artistIdentifier },
+      p_item_id: artistIdentifier,
       p_item_type: "artist"
     });
     
