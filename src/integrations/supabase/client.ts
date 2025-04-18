@@ -186,7 +186,8 @@ export async function getDeadLetterItems(
   message?: string;
 }> {
   try {
-    let query = supabase
+    // Use type assertion to bypass TypeScript checking
+    let query = (supabase as any)
       .from("dead_letter_items")
       .select("*", { count: "exact" });
     

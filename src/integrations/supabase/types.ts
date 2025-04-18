@@ -311,6 +311,45 @@ export type Database = {
         }
         Relationships: []
       }
+      dead_letter_items: {
+        Row: {
+          created_at: string
+          error_message: string | null
+          id: string
+          item_id: string
+          item_type: string
+          metadata: Json | null
+          original_batch_id: string
+          original_item_id: string
+          retry_count: number | null
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          error_message?: string | null
+          id?: string
+          item_id: string
+          item_type: string
+          metadata?: Json | null
+          original_batch_id: string
+          original_item_id: string
+          retry_count?: number | null
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          error_message?: string | null
+          id?: string
+          item_id?: string
+          item_type?: string
+          metadata?: Json | null
+          original_batch_id?: string
+          original_item_id?: string
+          retry_count?: number | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
       error_logs: {
         Row: {
           context: Json | null
