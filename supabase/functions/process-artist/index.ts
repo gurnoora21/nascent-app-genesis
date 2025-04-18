@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { SpotifyClient, supabase } from "../lib/api-clients.ts";
 import { 
@@ -13,7 +12,7 @@ const corsHeaders = {
 };
 
 // Process an artist's albums and tracks
-async function processArtist(artistIdentifier: string): Promise<{
+async function processArtist(artistIdentifier: string, isTestMode = false): Promise<{
   success: boolean;
   message: string;
   processedAlbums?: number;
@@ -118,6 +117,7 @@ async function processArtist(artistIdentifier: string): Promise<{
     const limit = 50;
     let totalProcessed = 0;
     let hasMore = true;
+    let processedAlbumIds: string[] = [];
     
     while (hasMore) {
       const albumsResult = await spotify.getArtistAlbums(
@@ -177,6 +177,8 @@ async function processArtist(artistIdentifier: string): Promise<{
             console.error(`Error storing album ${album.id}:`, albumError);
             continue;
           }
+
+          processedAlbumIds.push(newAlbum.id);
           
           // Update data quality score for the album
           await updateDataQualityScore(
@@ -214,7 +216,8 @@ async function processArtist(artistIdentifier: string): Promise<{
         status: "pending",
         metadata: {
           artist_spotify_id: artist.spotify_id,
-          artist_name: artist.name
+          artist_name: artist.name,
+          is_test_mode: isTestMode
         }
       })
       .select("id")
@@ -224,13 +227,33 @@ async function processArtist(artistIdentifier: string): Promise<{
       console.error(`Error creating tracks batch for artist ${artist.name}:`, batchError);
       throw batchError;
     }
-    
-    await logSystemEvent(
-      "info", 
-      "process_artist", 
-      `Created tracks batch ${batch.id} for artist ${artist.name}`,
-      { batchId: batch.id, artistId: artist.id }
-    );
+
+    // If in test mode, populate the batch with processing items
+    if (isTestMode && processedAlbumIds.length > 0) {
+      const processingItems = processedAlbumIds.map(albumId => ({
+        batch_id: batch.id,
+        item_type: 'album_for_tracks',
+        item_id: albumId,
+        status: 'pending',
+        priority: 5
+      }));
+
+      const { error: itemsError } = await supabase
+        .from("processing_items")
+        .insert(processingItems);
+
+      if (itemsError) {
+        console.error(`Error creating processing items for test batch:`, itemsError);
+        throw itemsError;
+      }
+
+      await logSystemEvent(
+        "info",
+        "process_artist",
+        `Created test batch ${batch.id} with ${processedAlbumIds.length} albums for artist ${artist.name}`,
+        { batchId: batch.id, artistId: artist.id, albumCount: processedAlbumIds.length }
+      );
+    }
     
     return {
       success: true,
@@ -265,7 +288,7 @@ serve(async (req) => {
   }
 
   try {
-    const { artistId } = await req.json();
+    const { artistId, isTestMode } = await req.json();
     
     if (!artistId) {
       return new Response(
@@ -283,7 +306,7 @@ serve(async (req) => {
       );
     }
 
-    const result = await processArtist(artistId);
+    const result = await processArtist(artistId, isTestMode);
     
     return new Response(
       JSON.stringify(result),
