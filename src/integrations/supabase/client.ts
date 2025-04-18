@@ -37,6 +37,7 @@ export function formatSpotifyReleaseDate(releaseDate: string | null): string | n
 export async function processArtist(artistId: string, isTestMode = false): Promise<{
   success: boolean;
   message: string;
+  batchId?: string;
 }> {
   try {
     // Create a new processing batch
@@ -47,7 +48,9 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
         status: "pending",
         metadata: {
           is_test_mode: isTestMode,
-          created_from_client: true
+          created_from_client: true,
+          created_at: new Date().toISOString(),
+          source: "client_request" 
         }
       })
       .select("id")
@@ -72,7 +75,8 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
         priority: 10, // High priority for manual requests
         metadata: {
           is_test_mode: isTestMode,
-          requested_at: new Date().toISOString()
+          requested_at: new Date().toISOString(),
+          source: "client_request"
         }
       });
     
@@ -86,7 +90,10 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
     
     // Trigger the processing function
     const { data, error } = await supabase.functions.invoke("process-artists-batch", {
-      body: {},
+      body: {
+        notifyOnCompletion: true,
+        clientRequestedBatchId: batch.id
+      },
     });
     
     if (error) {
@@ -99,13 +106,147 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
     
     return {
       success: true,
-      message: `Artist processing initiated. Batch ID: ${batch.id}`
+      message: `Artist processing initiated. Batch ID: ${batch.id}`,
+      batchId: batch.id
     };
   } catch (error) {
     console.error('Error in processArtist:', error);
     return {
       success: false,
       message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`,
+    };
+  }
+}
+
+// Get batch status - new function for checking batch progress
+export async function getBatchStatus(batchId: string): Promise<{
+  success: boolean;
+  status?: string;
+  progress?: {
+    total: number;
+    processed: number;
+    failed: number;
+    percentComplete: number;
+  };
+  message?: string;
+}> {
+  try {
+    const { data: batch, error } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .eq("id", batchId)
+      .single();
+    
+    if (error) {
+      return {
+        success: false,
+        message: `Error retrieving batch: ${error.message}`
+      };
+    }
+    
+    if (!batch) {
+      return {
+        success: false,
+        message: `Batch ${batchId} not found`
+      };
+    }
+    
+    const total = batch.items_total || 0;
+    const processed = batch.items_processed || 0;
+    const failed = batch.items_failed || 0;
+    const percentComplete = total > 0 ? Math.round((processed / total) * 100) : 0;
+    
+    return {
+      success: true,
+      status: batch.status,
+      progress: {
+        total,
+        processed,
+        failed,
+        percentComplete
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Get dead letter queue items - new function for viewing failed items
+export async function getDeadLetterItems(
+  limit = 50, 
+  offset = 0, 
+  itemType?: string
+): Promise<{
+  success: boolean;
+  items?: any[];
+  count?: number;
+  message?: string;
+}> {
+  try {
+    let query = supabase
+      .from("dead_letter_items")
+      .select("*", { count: "exact" });
+    
+    if (itemType) {
+      query = query.eq("item_type", itemType);
+    }
+    
+    const { data, count, error } = await query
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    
+    if (error) {
+      return {
+        success: false,
+        message: `Error retrieving dead letter items: ${error.message}`
+      };
+    }
+    
+    return {
+      success: true,
+      items: data,
+      count: count || 0
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Requeue a dead letter item - new function for retrying failed items
+export async function requeueDeadLetterItem(deadLetterId: string): Promise<{
+  success: boolean;
+  message: string;
+  batchId?: string;
+}> {
+  try {
+    const { data, error } = await supabase.functions.invoke("requeue-dead-letter", {
+      body: {
+        deadLetterId
+      },
+    });
+    
+    if (error) {
+      return {
+        success: false,
+        message: `Error requeuing item: ${error.message}`
+      };
+    }
+    
+    return {
+      success: true,
+      message: `Item requeued successfully`,
+      batchId: data?.batchId
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
     };
   }
 }

@@ -5,7 +5,8 @@ import {
   WorkerHeartbeat, 
   RateLimit, 
   DataQualityScore, 
-  SystemLogEntry 
+  SystemLogEntry,
+  MetricDimensions
 } from "./types.ts";
 
 const SUPABASE_URL = "https://nsxxzhhbcwzatvlulfyp.supabase.co";
@@ -97,8 +98,10 @@ export async function updateRateLimit(
     if (apiName === 'spotify') {
       limit = parseInt(headers.get('x-ratelimit-limit') || '0');
       remaining = parseInt(headers.get('x-ratelimit-remaining') || '0');
-      const resetSeconds = parseInt(headers.get('x-ratelimit-reset') || '0');
-      resetAt = new Date(Date.now() + resetSeconds * 1000).toISOString();
+      const resetSeconds = parseInt(headers.get('Retry-After') || '0');
+      resetAt = resetSeconds > 0 
+        ? new Date(Date.now() + resetSeconds * 1000).toISOString()
+        : null;
     } else if (apiName === 'discogs') {
       limit = parseInt(headers.get('x-discogs-ratelimit') || '0');
       remaining = parseInt(headers.get('x-discogs-ratelimit-remaining') || '0');
@@ -201,6 +204,23 @@ export async function updateItemStatus(
       .from('processing_items')
       .update(updates)
       .eq('id', itemId);
+    
+    // If item has reached max retries and status is error, move to dead letter queue
+    if (status === 'error') {
+      const { data: item } = await supabase
+        .from('processing_items')
+        .select('retry_count')
+        .eq('id', itemId)
+        .single();
+      
+      if (item && item.retry_count >= 3) {
+        await supabase.rpc('move_to_dead_letter_queue', { p_item_id: itemId });
+        await incrementMetric('items_moved_to_dlq', 1, { 
+          item_id: itemId, 
+          error: lastError?.substring(0, 100) 
+        });
+      }
+    }
   } catch (error) {
     console.error('Error updating item status:', error);
   }
@@ -326,29 +346,112 @@ export async function validateBatchIntegrity(batchId: string): Promise<{ valid: 
   }
 }
 
-// Retry and Backoff Utils
-export function calculateBackoff(
-  retryCount: number,
-  baseDelay = 1000,
-  maxDelay = 30000
-): number {
-  const delay = Math.min(
-    baseDelay * Math.pow(2, retryCount) * (0.5 + Math.random() * 0.5),
-    maxDelay
-  );
-  return delay;
+// New Dead Letter Queue functions
+export async function moveToDeadLetterQueue(
+  itemId: string,
+  errorMessage: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc('move_to_dead_letter_queue', {
+      p_item_id: itemId
+    });
+    
+    if (error) {
+      console.error('Error moving item to dead letter queue:', error);
+      return false;
+    }
+    
+    return data || false;
+  } catch (error) {
+    console.error('Error calling move_to_dead_letter_queue:', error);
+    return false;
+  }
 }
 
-export function isTransientError(error: Error): boolean {
-  const transientErrorPatterns = [
-    /network/i,
-    /timeout/i,
-    /rate limit/i,
-    /(429|503|504)/,
-    /temporarily unavailable/i,
-    /too many requests/i
-  ];
+export async function requeueDeadLetterItem(
+  deadLetterId: string,
+  batchId?: string
+): Promise<string | null> {
+  try {
+    const { data, error } = await supabase.rpc('requeue_dead_letter_item', {
+      p_dead_letter_id: deadLetterId,
+      p_batch_id: batchId
+    });
+    
+    if (error) {
+      console.error('Error requeuing dead letter item:', error);
+      return null;
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Error calling requeue_dead_letter_item:', error);
+    return null;
+  }
+}
+
+// Metrics tracking functions
+export async function incrementMetric(
+  metricName: string,
+  increment: number = 1,
+  dimensions?: MetricDimensions
+): Promise<void> {
+  try {
+    await supabase.rpc('increment_metric', {
+      p_metric_name: metricName,
+      p_increment: increment,
+      p_dimensions: dimensions
+    });
+  } catch (error) {
+    console.error(`Error incrementing metric ${metricName}:`, error);
+  }
+}
+
+// Sleep utility for controlled throttling
+export function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Config object for centralized configuration
+export const config = {
+  // Batch sizing
+  BATCH_SIZE_ALBUMS: Number(Deno.env.get("BATCH_SIZE_ALBUMS") || 25),
+  BATCH_SIZE_TRACKS: Number(Deno.env.get("BATCH_SIZE_TRACKS") || 50),
+  BATCH_SIZE_ARTISTS: Number(Deno.env.get("BATCH_SIZE_ARTISTS") || 10),
   
-  const errorString = error.message + (error.stack || '');
-  return transientErrorPatterns.some(pattern => pattern.test(errorString));
+  // Concurrency controls
+  SPOTIFY_CONCURRENCY: Number(Deno.env.get("SPOTIFY_CONCURRENCY") || 2),
+  DB_WRITE_BATCH_SIZE: Number(Deno.env.get("DB_WRITE_BATCH_SIZE") || 50),
+  
+  // Rate limiting
+  BASE_THROTTLE_MS: Number(Deno.env.get("RATE_LIMIT_MS") || 1000),
+  MAX_THROTTLE_MS: Number(Deno.env.get("MAX_RATE_LIMIT_MS") || 5000),
+  THROTTLE_INCREMENT_MS: Number(Deno.env.get("THROTTLE_INCREMENT_MS") || 500),
+  
+  // Retry settings
+  MAX_RETRIES: Number(Deno.env.get("MAX_RETRIES") || 3),
+  DB_WRITE_THROTTLE_MS: Number(Deno.env.get("DB_WRITE_THROTTLE_MS") || 50),
+  
+  // TTLs
+  BATCH_CLAIM_TTL_SECONDS: Number(Deno.env.get("BATCH_CLAIM_TTL_SECONDS") || 3600),
+  
+  // Worker settings
+  WORKER_HEARTBEAT_INTERVAL_MS: Number(Deno.env.get("WORKER_HEARTBEAT_INTERVAL_MS") || 30000)
+};
+
+// Reset expired batches (for scheduled jobs)
+export async function resetExpiredBatches(): Promise<number> {
+  try {
+    const { data, error } = await supabase.rpc('reset_expired_batches');
+    
+    if (error) {
+      console.error('Error resetting expired batches:', error);
+      return 0;
+    }
+    
+    return data || 0;
+  } catch (error) {
+    console.error('Error calling reset_expired_batches:', error);
+    return 0;
+  }
 }

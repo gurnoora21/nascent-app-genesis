@@ -1,4 +1,3 @@
-
 export interface ProcessingItem {
   id: string;
   batch_id: string;
@@ -45,3 +44,22 @@ export interface SystemLogEntry {
   context?: any;
   trace_id?: string;
 }
+
+// Add MetricDimensions type for metrics tracking
+export type MetricDimensions = {
+  [key: string]: string | number | boolean | null;
+};
+
+// Add DeadLetterItem type
+export type DeadLetterItem = {
+  id: string;
+  original_item_id: string;
+  original_batch_id: string;
+  item_type: string;
+  item_id: string;
+  error_message?: string;
+  metadata?: any;
+  retry_count?: number;
+  created_at: string;
+  updated_at: string;
+};
