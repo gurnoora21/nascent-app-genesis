@@ -63,3 +63,34 @@ export function calculateBackoff(retryCount: number, baseDelay = 1000): number {
   
   return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
 }
+
+// Process an artist with test mode option
+export async function processArtist(artistId: string, isTestMode = false): Promise<{
+  success: boolean;
+  message: string;
+  processedAlbums?: number;
+}> {
+  try {
+    const { data, error } = await supabase.functions.invoke("process-artist", {
+      body: { artistId, isTestMode },
+    });
+    
+    if (error) {
+      console.error('Error calling process-artist function:', error);
+      return {
+        success: false,
+        message: `Error: ${error.message}`,
+        processedAlbums: 0
+      };
+    }
+    
+    return data;
+  } catch (error) {
+    console.error('Error in processArtist:', error);
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      processedAlbums: 0
+    };
+  }
+}

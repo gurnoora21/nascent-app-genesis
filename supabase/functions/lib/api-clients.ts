@@ -13,14 +13,42 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 export class ApiRateLimiter {
   private apiName: string;
   private endpoint: string;
+  private cacheTimeMs: number;
+  private cache: Map<string, {data: any, timestamp: number}> = new Map();
 
-  constructor(apiName: string, endpoint: string) {
+  constructor(apiName: string, endpoint: string, cacheTimeMs = 3600000) { // Default cache: 1 hour
     this.apiName = apiName;
     this.endpoint = endpoint;
+    this.cacheTimeMs = cacheTimeMs;
+  }
+
+  // Get cached data if available
+  getCachedData(cacheKey: string): any | null {
+    if (!this.cache.has(cacheKey)) return null;
+    
+    const cachedItem = this.cache.get(cacheKey);
+    if (!cachedItem) return null;
+    
+    // Check if cache is still valid
+    if (Date.now() - cachedItem.timestamp < this.cacheTimeMs) {
+      return cachedItem.data;
+    }
+    
+    // Cache expired
+    this.cache.delete(cacheKey);
+    return null;
+  }
+
+  // Store data in cache
+  setCachedData(cacheKey: string, data: any): void {
+    this.cache.set(cacheKey, {
+      data,
+      timestamp: Date.now()
+    });
   }
 
   // Check if endpoint is rate limited
-  async isRateLimited(): Promise<boolean> {
+  async isRateLimited(): Promise<{limited: boolean, retryAfter?: number}> {
     try {
       const { data, error } = await supabase
         .from("api_rate_limits")
@@ -31,10 +59,10 @@ export class ApiRateLimiter {
 
       if (error) {
         console.error("Error checking rate limit:", error);
-        return false;
+        return { limited: false };
       }
 
-      if (!data) return false;
+      if (!data) return { limited: false };
 
       // If reset time is in the future and no requests remaining
       if (
@@ -43,19 +71,21 @@ export class ApiRateLimiter {
         data.requests_remaining <= 0 &&
         new Date(data.reset_at) > new Date()
       ) {
-        return true;
+        // Calculate seconds remaining until reset
+        const secondsUntilReset = Math.ceil((new Date(data.reset_at).getTime() - Date.now()) / 1000);
+        return { limited: true, retryAfter: secondsUntilReset };
       }
 
       // If reset time is in the past, we can reset the counter
       if (data.reset_at && new Date(data.reset_at) <= new Date()) {
         await this.resetRateLimit();
-        return false;
+        return { limited: false };
       }
 
-      return false;
+      return { limited: false };
     } catch (err) {
       console.error("Error in isRateLimited:", err);
-      return false;
+      return { limited: false };
     }
   }
 
@@ -73,6 +103,12 @@ export class ApiRateLimiter {
         remaining = parseInt(headers.get("x-ratelimit-remaining") || "0");
         const resetSeconds = parseInt(headers.get("x-ratelimit-reset") || "0");
         resetAt = new Date(Date.now() + resetSeconds * 1000).toISOString();
+      }
+      // Retry-After header (Spotify uses this for 429)
+      else if (headers.get("retry-after")) {
+        remaining = 0; // We're rate limited
+        const retryAfterSeconds = parseInt(headers.get("retry-after") || "1");
+        resetAt = new Date(Date.now() + retryAfterSeconds * 1000).toISOString();
       }
       // Genius format
       else if (headers.get("x-ratelimit-limit")) {
@@ -146,7 +182,8 @@ export class RetryHelper {
     operation: () => Promise<T>, 
     maxRetries = 3, 
     initialDelay = 1000, 
-    operationName = "operation"
+    operationName = "operation",
+    isRetryable?: (error: Error) => boolean
   ): Promise<T> {
     let attempt = 0;
     
@@ -155,12 +192,30 @@ export class RetryHelper {
         return await operation();
       } catch (error) {
         attempt++;
+        
+        // Check if we should retry based on error type
+        if (isRetryable && !isRetryable(error)) {
+          console.error(`${operationName} failed with non-retryable error:`, error);
+          throw error;
+        }
+        
         if (attempt > maxRetries) {
           console.error(`${operationName} failed after ${maxRetries} retries:`, error);
           throw error;
         }
         
-        const delay = initialDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random() * 0.5);
+        // Check for retry-after in headers if it's a response error
+        let retryAfter = 0;
+        if (error.headers && error.headers.get) {
+          const retryAfterHeader = error.headers.get('retry-after');
+          if (retryAfterHeader) {
+            retryAfter = parseInt(retryAfterHeader) * 1000;
+          }
+        }
+        
+        // Use retry-after from header or exponential backoff with jitter
+        const delay = retryAfter || initialDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random() * 0.5);
+        
         console.warn(`${operationName} attempt ${attempt} failed, retrying in ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
@@ -169,17 +224,31 @@ export class RetryHelper {
 }
 
 /**
- * Spotify API Client
+ * Spotify API Client with improved rate limiting and batching
  */
 export class SpotifyClient {
   private accessToken: string | null = null;
   private tokenExpiry: Date | null = null;
   private clientId: string;
   private clientSecret: string;
+  private requestThrottleMs: number = 200; // Default throttle between requests
+  private cacheEnabled: boolean = true;
 
-  constructor() {
+  constructor(throttleMs = 200, enableCache = true) {
     this.clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
     this.clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
+    this.requestThrottleMs = throttleMs;
+    this.cacheEnabled = enableCache;
+  }
+
+  // Set throttle time between requests
+  setThrottle(milliseconds: number): void {
+    this.requestThrottleMs = milliseconds;
+  }
+
+  // Enable or disable caching
+  setCache(enabled: boolean): void {
+    this.cacheEnabled = enabled;
   }
 
   // Get a valid access token
@@ -218,16 +287,49 @@ export class SpotifyClient {
     }
   }
 
-  // Make authenticated request to Spotify API
-  async makeRequest(endpoint: string, method = "GET", body?: any): Promise<any> {
+  // Make authenticated request to Spotify API with retry and rate limit handling
+  async makeRequest(endpoint: string, method = "GET", body?: any, cacheKey?: string): Promise<any> {
     const rateLimiter = new ApiRateLimiter("spotify", endpoint);
     
+    // Try to get from cache first if enabled and a cache key is provided
+    if (this.cacheEnabled && cacheKey) {
+      const cachedData = rateLimiter.getCachedData(cacheKey);
+      if (cachedData) {
+        console.log(`Using cached data for ${endpoint} with key ${cacheKey}`);
+        return cachedData;
+      }
+    }
+    
     // Check if we're rate limited
-    if (await rateLimiter.isRateLimited()) {
-      throw new Error(`Rate limited for Spotify API endpoint: ${endpoint}`);
+    const rateLimitStatus = await rateLimiter.isRateLimited();
+    if (rateLimitStatus.limited) {
+      console.warn(`Rate limited for Spotify API endpoint: ${endpoint}. Retry after ${rateLimitStatus.retryAfter || 0} seconds.`);
+      throw new Error(`Rate limited for Spotify API endpoint: ${endpoint}. Retry after ${rateLimitStatus.retryAfter || 0} seconds.`);
     }
 
+    // Throttle requests to avoid hitting rate limits
+    await new Promise(resolve => setTimeout(resolve, this.requestThrottleMs));
+
     try {
+      const isRetryable = (error: any) => {
+        // Retry on network errors and 5xx server errors
+        if (error.message && (
+            error.message.includes('network') || 
+            error.message.includes('timeout') ||
+            error.message.includes('500') || 
+            error.message.includes('503')
+        )) {
+          return true;
+        }
+        
+        // Don't retry on 4xx client errors except 429 (rate limit)
+        if (error.status && error.status !== 429 && error.status < 500 && error.status >= 400) {
+          return false;
+        }
+        
+        return true;
+      };
+      
       return await RetryHelper.retryOperation(async () => {
         const token = await this.getAccessToken();
         
@@ -244,8 +346,22 @@ export class SpotifyClient {
         }
 
         const response = await fetch(`https://api.spotify.com/v1${endpoint}`, options);
-        let data;
         
+        // Handle rate limiting before we parse the response
+        if (response.status === 429) {
+          // Get retry-after header
+          const retryAfter = parseInt(response.headers.get("Retry-After") || "1");
+          const error: any = new Error(`Spotify rate limit exceeded. Retry after ${retryAfter} seconds.`);
+          error.status = 429;
+          error.headers = response.headers;
+          
+          // Update rate limit tracking
+          await rateLimiter.updateRateLimit(response.headers, { error: "Rate limited" });
+          
+          throw error;
+        }
+        
+        let data;
         try {
           data = await response.json();
         } catch (jsonError) {
@@ -257,19 +373,22 @@ export class SpotifyClient {
         await rateLimiter.updateRateLimit(response.headers, data);
 
         if (!response.ok) {
-          if (response.status === 429) {
-            // Handle rate limiting
-            const retryAfter = parseInt(response.headers.get("Retry-After") || "1");
-            throw new Error(`Spotify rate limit exceeded. Retry after ${retryAfter} seconds.`);
-          }
-          throw new Error(`Spotify API error: ${JSON.stringify(data)}`);
+          const error: any = new Error(`Spotify API error: ${JSON.stringify(data)}`);
+          error.status = response.status;
+          error.headers = response.headers;
+          throw error;
         }
 
+        // Store in cache if caching is enabled and we have a cache key
+        if (this.cacheEnabled && cacheKey) {
+          rateLimiter.setCachedData(cacheKey, data);
+        }
+        
         // Log the successful response for debugging
         console.log(`Spotify API ${endpoint} response status: ${response.status}`);
         
         return data;
-      }, 3, 2000, `Spotify API call to ${endpoint}`);
+      }, 3, 2000, `Spotify API call to ${endpoint}`, isRetryable);
     } catch (error) {
       console.error(`Error calling Spotify API ${endpoint}:`, error);
       await this.logError("api", `Error calling Spotify API ${endpoint}`, error);
@@ -277,10 +396,15 @@ export class SpotifyClient {
     }
   }
 
-  // Search for artists by name or genre
+  // Search for artists by name or genre with improved caching
   async searchArtists(query: string, limit = 20, offset = 0): Promise<any> {
+    const cacheKey = `search_artists_${query}_${limit}_${offset}`;
+    
     const result = await this.makeRequest(
-      `/search?type=artist&q=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}`
+      `/search?type=artist&q=${encodeURIComponent(query)}&limit=${limit}&offset=${offset}`,
+      "GET",
+      undefined,
+      cacheKey
     );
     
     // Add validation to ensure expected structure
@@ -294,7 +418,9 @@ export class SpotifyClient {
 
   // Get artist by ID
   async getArtist(id: string): Promise<any> {
-    const result = await this.makeRequest(`/artists/${id}`);
+    const cacheKey = `artist_${id}`;
+    
+    const result = await this.makeRequest(`/artists/${id}`, "GET", undefined, cacheKey);
     
     // Validate response
     if (!result || !result.id || !result.name) {
@@ -305,7 +431,7 @@ export class SpotifyClient {
     return result;
   }
 
-  // Get artist's albums
+  // Get artist's albums with efficient batching and caching
   async getArtistAlbums(
     id: string, 
     limit = 50, 
@@ -313,8 +439,13 @@ export class SpotifyClient {
     include_groups = "album,single,compilation,appears_on"
   ): Promise<any> {
     try {
+      const cacheKey = `artist_albums_${id}_${limit}_${offset}_${include_groups}`;
+      
       const result = await this.makeRequest(
-        `/artists/${id}/albums?limit=${limit}&offset=${offset}&include_groups=${encodeURIComponent(include_groups)}`
+        `/artists/${id}/albums?limit=${limit}&offset=${offset}&include_groups=${encodeURIComponent(include_groups)}`,
+        "GET",
+        undefined,
+        cacheKey
       );
       
       // Validate and normalize response 
@@ -345,7 +476,9 @@ export class SpotifyClient {
 
   // Get album details
   async getAlbum(id: string): Promise<any> {
-    const result = await this.makeRequest(`/albums/${id}`);
+    const cacheKey = `album_${id}`;
+    
+    const result = await this.makeRequest(`/albums/${id}`, "GET", undefined, cacheKey);
     
     // Validate response
     if (!result || !result.id || !result.name) {
@@ -356,11 +489,16 @@ export class SpotifyClient {
     return result;
   }
 
-  // Get album tracks
+  // Get album tracks with caching
   async getAlbumTracks(id: string, limit = 50, offset = 0): Promise<any> {
     try {
+      const cacheKey = `album_tracks_${id}_${limit}_${offset}`;
+      
       const result = await this.makeRequest(
-        `/albums/${id}/tracks?limit=${limit}&offset=${offset}`
+        `/albums/${id}/tracks?limit=${limit}&offset=${offset}`,
+        "GET",
+        undefined,
+        cacheKey
       );
       
       // Validate and normalize response
@@ -389,9 +527,41 @@ export class SpotifyClient {
     }
   }
 
+  // Get multiple tracks in a single batch request (up to 50)
+  async getTracks(ids: string[]): Promise<any> {
+    if (!ids.length) return { tracks: [] };
+    
+    // Spotify allows max 50 IDs per request
+    const batchSize = 50;
+    const batches = [];
+    
+    for (let i = 0; i < ids.length; i += batchSize) {
+      const batchIds = ids.slice(i, i + batchSize);
+      const cacheKey = `tracks_batch_${batchIds.join('_')}`;
+      
+      batches.push(
+        this.makeRequest(
+          `/tracks?ids=${encodeURIComponent(batchIds.join(','))}`,
+          "GET",
+          undefined,
+          cacheKey
+        )
+      );
+    }
+    
+    const results = await Promise.all(batches);
+    
+    // Combine all batch results
+    const tracks = results.flatMap(result => result.tracks || []);
+    
+    return { tracks };
+  }
+
   // Get track details
   async getTrack(id: string): Promise<any> {
-    const result = await this.makeRequest(`/tracks/${id}`);
+    const cacheKey = `track_${id}`;
+    
+    const result = await this.makeRequest(`/tracks/${id}`, "GET", undefined, cacheKey);
     
     // Validate response
     if (!result || !result.id || !result.name) {
