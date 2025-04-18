@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
-import { formatSpotifyReleaseDate } from "../../integrations/supabase/client.ts";
 
 // CORS headers for browser access
 const corsHeaders = {
@@ -17,28 +16,6 @@ function calculateBackoff(retryCount: number, baseDelay = 1000): number {
   const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
   
   return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
-}
-
-// Manually format Spotify release dates since we can't use the utility function
-function formatReleaseDate(releaseDate: string | null): string | null {
-  if (!releaseDate) return null;
-  
-  const dateParts = releaseDate.split('-');
-  
-  if (dateParts.length === 1 && dateParts[0].length === 4) {
-    // Year only format (e.g., "2012") - append "-01-01" to make it January 1st
-    return `${releaseDate}-01-01`;
-  } else if (dateParts.length === 2) {
-    // Year-month format (e.g., "2012-03") - append "-01" to make it the 1st day of the month
-    return `${releaseDate}-01`;
-  } else if (dateParts.length === 3) {
-    // Already full date format, return as is
-    return releaseDate;
-  } else {
-    // Unknown format, log it and return null
-    console.error(`Unknown release date format: ${releaseDate}`);
-    return null;
-  }
 }
 
 // Check if API is rate limited
@@ -111,8 +88,8 @@ async function validateBatchIntegrity(batchId: string): Promise<{valid: boolean,
   }
 }
 
-// Process a pending tracks batch
-async function processTracksBatch(): Promise<{
+// Process a pending albums batch
+async function processAlbumsBatch(): Promise<{
   success: boolean;
   message: string;
   batchId?: string;
@@ -124,10 +101,10 @@ async function processTracksBatch(): Promise<{
     // Generate a unique worker ID
     const workerId = crypto.randomUUID();
     
-    console.log(`Worker ${workerId} claiming a tracks batch`);
+    console.log(`Worker ${workerId} claiming an albums batch`);
     
     // Pre-flight check: Check if API is rate limited
-    const apiLimited = await isApiRateLimited("spotify", "/tracks");
+    const apiLimited = await isApiRateLimited("spotify", "/albums");
     if (apiLimited) {
       return {
         success: true,
@@ -140,7 +117,7 @@ async function processTracksBatch(): Promise<{
     const { data: batchId, error: claimError } = await supabase.rpc(
       "claim_processing_batch",
       {
-        p_batch_type: "process_tracks",
+        p_batch_type: "process_albums",
         p_worker_id: workerId,
         p_claim_ttl_seconds: 3600 // 1 hour claim time
       }
@@ -154,12 +131,12 @@ async function processTracksBatch(): Promise<{
     if (!batchId) {
       return {
         success: true,
-        message: "No pending tracks batches found to process",
+        message: "No pending albums batches found to process",
         status: "idle"
       };
     }
     
-    console.log(`Worker ${workerId} claimed tracks batch ${batchId}`);
+    console.log(`Worker ${workerId} claimed albums batch ${batchId}`);
     
     // Validate batch integrity
     const batchValidation = await validateBatchIntegrity(batchId);
@@ -193,9 +170,9 @@ async function processTracksBatch(): Promise<{
     }
     
     // Define batch-specific parameters
-    const batchSize = 5; // Smaller batch size for album track processing
+    const batchSize = 10; // Default conservative batch size
     
-    // Get items to process - these are albums we need to extract tracks from
+    // Get items to process
     const { data: items, error: itemsError } = await supabase
       .from("processing_items")
       .select("*")
@@ -222,11 +199,11 @@ async function processTracksBatch(): Promise<{
       );
       
       // For completed batches, create the next batch in the pipeline
-      await createProducersBatch(batchId);
+      await createTracksBatch(batchId);
       
       return {
         success: true,
-        message: "Tracks batch claimed but no items to process",
+        message: "Albums batch claimed but no items to process",
         batchId,
         processed: 0,
         failed: 0,
@@ -234,15 +211,15 @@ async function processTracksBatch(): Promise<{
       };
     }
     
-    console.log(`Processing ${items.length} album-track items in batch ${batchId}`);
+    console.log(`Processing ${items.length} albums in batch ${batchId}`);
     
     const processedItems: string[] = [];
     const failedItems: string[] = [];
     
-    // Process tracks from albums
-    const trackIds = await processAlbumTracks(items, processedItems, failedItems);
+    // Process album items
+    await processAlbumItems(batchId, items, processedItems, failedItems);
     
-    console.log(`Tracks batch ${batchId} processing complete. Processed: ${processedItems.length}, Failed: ${failedItems.length}, Tracks found: ${trackIds.length}`);
+    console.log(`Albums batch ${batchId} processing complete. Processed: ${processedItems.length}, Failed: ${failedItems.length}`);
     
     // Get accurate counts from the database for this batch
     const { count: totalItems, error: countError } = await supabase
@@ -283,7 +260,7 @@ async function processTracksBatch(): Promise<{
     
     // If batch is completed, create next batch in pipeline
     if (allDone) {
-      await createProducersBatch(batchId, trackIds);
+      await createTracksBatch(batchId);
     }
     
     // Update batch with accurate progress
@@ -300,175 +277,73 @@ async function processTracksBatch(): Promise<{
     
     return {
       success: true,
-      message: `Processed ${processedItems.length} album-track items, found ${trackIds.length} tracks, failed ${failedItems.length} items, ${pendingItems || 'unknown'} items remaining`,
+      message: `Processed ${processedItems.length} albums, failed ${failedItems.length} albums, ${pendingItems || 'unknown'} items remaining`,
       batchId,
       processed: processedItems.length,
       failed: failedItems.length,
       status: allDone ? "completed" : "in_progress"
     };
   } catch (error) {
-    console.error("Error processing tracks batch:", error);
+    console.error("Error processing albums batch:", error);
     
     // Log error to our database
     await supabase.rpc("log_error", {
       p_error_type: "processing",
-      p_source: "process_tracks_batch",
-      p_message: `Error processing tracks batch`,
+      p_source: "process_albums_batch",
+      p_message: `Error processing albums batch`,
       p_stack_trace: error.stack || "",
-      p_context: { batchType: "process_tracks" }
+      p_context: { batchType: "process_albums" }
     });
     
     return {
       success: false,
-      message: `Error processing tracks batch: ${error.message}`,
+      message: `Error processing albums batch: ${error.message}`,
       status: "error"
     };
   }
 }
 
-// Process tracks from albums and store them
-async function processAlbumTracks(
+// Process album items with error handling
+async function processAlbumItems(
+  batchId: string,
   items: any[], 
   processedItems: string[], 
   failedItems: string[]
-): Promise<string[]> {
-  const allTrackIds: string[] = [];
-  
-  // Process each album to extract and store its tracks
+): Promise<void> {
+  // Process each album - this only updates the album metadata, not track data
   for (const item of items) {
     try {
-      if (item.item_type !== "album_for_tracks") {
-        throw new Error(`Expected item_type "album_for_tracks", got "${item.item_type}"`);
-      }
+      console.log(`Processing album ${item.item_id}`);
       
-      const albumId = item.item_id;
-      console.log(`Processing tracks for album ${albumId}`);
+      if (item.item_type !== "album") {
+        throw new Error(`Expected item_type "album", got "${item.item_type}"`);
+      }
       
       // Get the album details
       const { data: album, error: albumError } = await supabase
         .from("albums")
         .select("*")
-        .eq("id", albumId)
+        .eq("id", item.item_id)
         .single();
       
       if (albumError || !album) {
         throw new Error(`Album not found: ${albumError?.message || "No data returned"}`);
       }
       
-      // Fetch the album tracks
-      const response = await fetch(
-        `https://api.spotify.com/v1/albums/${album.spotify_id}/tracks?limit=50`,
-        {
-          headers: {
-            "Authorization": `Bearer ${await getSpotifyAccessToken()}`
-          }
-        }
-      );
+      // Get the artist details for this album
+      const { data: artist, error: artistError } = await supabase
+        .from("artists")
+        .select("*")
+        .eq("id", album.artist_id)
+        .single();
       
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`HTTP error ${response.status}: ${errorText}`);
+      if (artistError || !artist) {
+        throw new Error(`Artist not found: ${artistError?.message || "No data returned"}`);
       }
       
-      const trackData = await response.json();
-      
-      if (!trackData || !trackData.items || !Array.isArray(trackData.items)) {
-        throw new Error(`Invalid track data returned from Spotify API`);
-      }
-      
-      console.log(`Found ${trackData.items.length} tracks for album ${albumId}`);
-      
-      // Store each track and link to album
-      for (const track of trackData.items) {
-        try {
-          // Check if track already exists
-          const { data: existingTrack, error: existsError } = await supabase
-            .from("tracks")
-            .select("id")
-            .eq("spotify_id", track.id)
-            .maybeSingle();
-          
-          let trackId;
-          
-          if (existingTrack) {
-            trackId = existingTrack.id;
-            
-            // Update track data
-            await supabase
-              .from("tracks")
-              .update({
-                name: track.name,
-                popularity: track.popularity || 0,
-                spotify_url: track.external_urls?.spotify,
-                preview_url: track.preview_url,
-                updated_at: new Date().toISOString(),
-                artist_id: album.artist_id,
-                release_date: formatReleaseDate(album.release_date),
-                metadata: {
-                  spotify: track,
-                  source_album_id: albumId
-                }
-              })
-              .eq("id", trackId);
-          } else {
-            // Create new track
-            const { data: newTrack, error: createError } = await supabase
-              .from("tracks")
-              .insert({
-                name: track.name,
-                spotify_id: track.id,
-                popularity: track.popularity || 0,
-                spotify_url: track.external_urls?.spotify,
-                preview_url: track.preview_url,
-                artist_id: album.artist_id,
-                release_date: formatReleaseDate(album.release_date),
-                metadata: {
-                  spotify: track,
-                  source_album_id: albumId
-                }
-              })
-              .select("id")
-              .single();
-            
-            if (createError) {
-              console.error(`Error creating track ${track.name}:`, createError);
-              continue;
-            }
-            
-            trackId = newTrack.id;
-          }
-          
-          // Link track to album
-          await supabase
-            .from("track_albums")
-            .upsert({
-              track_id: trackId,
-              album_id: albumId,
-              track_number: track.track_number,
-              disc_number: track.disc_number
-            }, {
-              onConflict: "track_id,album_id"
-            });
-          
-          // Link track to artist
-          await supabase
-            .from("track_artists")
-            .upsert({
-              track_id: trackId,
-              artist_id: album.artist_id,
-              is_primary: true
-            }, {
-              onConflict: "track_id,artist_id"
-            });
-          
-          // Add track ID to our list for next batch
-          allTrackIds.push(trackId);
-          
-        } catch (trackError) {
-          console.error(`Error processing track ${track.name} from album ${albumId}:`, trackError);
-          // Continue processing other tracks even if one fails
-        }
-      }
+      // Update album with additional metadata if needed
+      // This could involve fetching more data from the Spotify API
+      // but for now, we're just marking it as processed
       
       // Mark item as processed
       await supabase
@@ -477,7 +352,6 @@ async function processAlbumTracks(
           status: "completed",
           metadata: {
             ...item.metadata,
-            tracks_processed: trackData.items.length,
             processed_at: new Date().toISOString()
           }
         })
@@ -486,7 +360,7 @@ async function processAlbumTracks(
       processedItems.push(item.id);
       
     } catch (error) {
-      console.error(`Error processing album tracks for ${item.item_id}:`, error);
+      console.error(`Error processing album ${item.item_id}:`, error);
       
       // If retry count < 5, increment and keep as pending
       const shouldRetry = (item.retry_count || 0) < 5;
@@ -517,8 +391,8 @@ async function processAlbumTracks(
       // Log specific error
       await supabase.rpc("log_error", {
         p_error_type: "processing",
-        p_source: "process_tracks_batch",
-        p_message: `Error processing album tracks for ${item.item_id}`,
+        p_source: "process_albums_batch",
+        p_message: `Error processing album ${item.item_id}`,
         p_stack_trace: error.stack || "",
         p_context: { item },
         p_item_id: item.item_id,
@@ -526,51 +400,20 @@ async function processAlbumTracks(
       });
     }
   }
-  
-  return allTrackIds;
 }
 
-// Get Spotify access token
-async function getSpotifyAccessToken(): Promise<string> {
-  const clientId = Deno.env.get("SPOTIFY_CLIENT_ID");
-  const clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET");
-  
-  if (!clientId || !clientSecret) {
-    throw new Error("Spotify credentials not configured");
-  }
-  
-  const authString = `${clientId}:${clientSecret}`;
-  const base64Auth = btoa(authString);
-  
-  const response = await fetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${base64Auth}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: "grant_type=client_credentials"
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Failed to get Spotify access token: ${response.status} ${response.statusText}`);
-  }
-  
-  const data = await response.json();
-  return data.access_token;
-}
-
-// Create the next batch in the pipeline (producers batch)
-async function createProducersBatch(tracksBatchId: string, tracksFromCurrentBatch: string[] = []): Promise<string | null> {
+// Create the next batch in the pipeline (tracks batch)
+async function createTracksBatch(albumsBatchId: string): Promise<string | null> {
   try {
-    // Create a new batch for processing producers
+    // Create a new batch for processing tracks
     const { data: newBatch, error: createError } = await supabase
       .from("processing_batches")
       .insert({
-        batch_type: "process_producers",
+        batch_type: "process_tracks",
         status: "pending",
         metadata: {
-          parent_batch_id: tracksBatchId,
-          parent_batch_type: "process_tracks",
+          parent_batch_id: albumsBatchId,
+          parent_batch_type: "process_albums",
           processing_pipeline: true
         }
       })
@@ -578,69 +421,75 @@ async function createProducersBatch(tracksBatchId: string, tracksFromCurrentBatc
       .single();
     
     if (createError) {
-      console.error(`Error creating producers batch:`, createError);
+      console.error(`Error creating tracks batch:`, createError);
       return null;
     }
     
-    console.log(`Created producers batch with ID ${newBatch.id}`);
+    console.log(`Created tracks batch with ID ${newBatch.id}`);
     
-    // Get tracks to process - first from current batch if provided
-    let tracksToProcess: string[] = [...tracksFromCurrentBatch];
+    // Get completed album items
+    const { data: completedItems, error: itemsError } = await supabase
+      .from("processing_items")
+      .select("item_id, priority, metadata")
+      .eq("batch_id", albumsBatchId)
+      .eq("item_type", "album")
+      .eq("status", "completed");
     
-    // If we don't have enough tracks from current batch, look for more tracks that need producer identification
-    if (tracksToProcess.length < 50) {
-      const { data: tracks, error: tracksError } = await supabase
-        .from("tracks")
-        .select("id")
-        .not("id", "in", supabase.from("track_producers").select("track_id"))
-        .limit(50 - tracksToProcess.length);
-      
-      if (!tracksError && tracks && tracks.length > 0) {
-        tracksToProcess = [...tracksToProcess, ...tracks.map(t => t.id)];
-      }
-    }
-    
-    if (tracksToProcess.length === 0) {
-      console.log(`No tracks found for producer identification`);
+    if (itemsError) {
+      console.error(`Error getting completed album items:`, itemsError);
       return newBatch.id;
     }
     
-    // Create processing items for each track
-    const producerItems = tracksToProcess.map(trackId => ({
-      batch_id: newBatch.id,
-      item_type: "track",
-      item_id: trackId,
-      status: "pending",
-      priority: 10, // High priority
-      metadata: {
-        source_batch_id: tracksBatchId,
-        pipeline_stage: "process_producers"
-      }
-    }));
+    if (!completedItems || completedItems.length === 0) {
+      console.log(`No completed albums found in batch ${albumsBatchId}`);
+      return newBatch.id;
+    }
     
-    if (producerItems.length > 0) {
+    // Get the album IDs
+    const albumIds = completedItems.map(item => item.item_id);
+    
+    // Create processing items for each album to process their tracks
+    const trackBatchItems = albumIds.map((albumId, index) => {
+      const item = completedItems[index];
+      return {
+        batch_id: newBatch.id,
+        item_type: "album_for_tracks",
+        item_id: albumId,
+        status: "pending",
+        priority: item.priority || 5,
+        metadata: {
+          source_batch_id: albumsBatchId,
+          artist_id: item.metadata?.artist_id,
+          pipeline_stage: "process_tracks"
+        }
+      };
+    });
+    
+    if (trackBatchItems.length > 0) {
       const { error: insertError } = await supabase
         .from("processing_items")
-        .insert(producerItems);
+        .insert(trackBatchItems);
       
       if (insertError) {
-        console.error(`Error creating producer identification items:`, insertError);
+        console.error(`Error creating track batch items:`, insertError);
       } else {
-        console.log(`Added ${producerItems.length} tracks to producer identification batch ${newBatch.id}`);
+        console.log(`Added ${trackBatchItems.length} albums to process for tracks in batch ${newBatch.id}`);
         
         // Update the batch with the accurate total number of items
         await supabase
           .from("processing_batches")
           .update({
-            items_total: producerItems.length
+            items_total: trackBatchItems.length
           })
           .eq("id", newBatch.id);
       }
+    } else {
+      console.log(`No albums to add to tracks batch ${newBatch.id}`);
     }
     
     return newBatch.id;
   } catch (error) {
-    console.error(`Error creating producers batch:`, error);
+    console.error(`Error creating tracks batch:`, error);
     return null;
   }
 }
@@ -652,42 +501,7 @@ serve(async (req) => {
   }
 
   try {
-    // Allow for manual processing through payload
-    if (req.method === "POST") {
-      const payload = await req.json();
-      
-      if (payload.action === "process") {
-        const result = await processTracksBatch();
-        
-        return new Response(
-          JSON.stringify(result),
-          {
-            status: result.success ? 200 : 500,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders,
-            },
-          }
-        );
-      }
-      
-      return new Response(
-        JSON.stringify({
-          success: false,
-          message: "Invalid action specified",
-        }),
-        {
-          status: 400,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders,
-          },
-        }
-      );
-    }
-    
-    // Default behavior: process a batch
-    const result = await processTracksBatch();
+    const result = await processAlbumsBatch();
     
     return new Response(
       JSON.stringify(result),
@@ -700,14 +514,14 @@ serve(async (req) => {
       }
     );
   } catch (error) {
-    console.error("Error handling process-tracks-batch request:", error);
+    console.error("Error handling process-albums-batch request:", error);
     
     // Log error to our database
     try {
       await supabase.rpc("log_error", {
         p_error_type: "endpoint",
-        p_source: "process_tracks_batch",
-        p_message: "Error handling process-tracks-batch request",
+        p_source: "process_albums_batch",
+        p_message: "Error handling process-albums-batch request",
         p_stack_trace: error.stack || "",
         p_context: { error: error.message },
       });

@@ -7,11 +7,17 @@ verify_jwt = false
 [functions.process-artist]
 verify_jwt = false
 
-[functions.process-batch]
+[functions.process-artists-batch]
 verify_jwt = false
 
-[functions.identify-producers]
+[functions.process-albums-batch]
 verify_jwt = false
 
 [functions.process-tracks-batch]
+verify_jwt = false
+
+[functions.process-producers-batch]
+verify_jwt = false
+
+[functions.identify-producers]
 verify_jwt = false
