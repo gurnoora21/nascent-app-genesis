@@ -1,6 +1,11 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { SpotifyClient, supabase } from "../lib/api-clients.ts";
+import { 
+  logSystemEvent, 
+  logProcessingError,
+  updateDataQualityScore 
+} from "../lib/pipeline-utils.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -44,7 +49,12 @@ async function processArtist(artistIdentifier: string): Promise<{
       
       if (artistError) {
         // Artist doesn't exist yet, create it first
-        console.log(`Artist with Spotify ID ${artistIdentifier} not found. Creating new entry.`);
+        await logSystemEvent(
+          "info", 
+          "process_artist", 
+          `Artist with Spotify ID ${artistIdentifier} not found. Creating new entry.`,
+          { spotifyId: artistIdentifier }
+        );
         
         // Get artist info from Spotify
         const spotifyArtist = await spotify.getArtist(artistIdentifier);
@@ -76,6 +86,17 @@ async function processArtist(artistIdentifier: string): Promise<{
         }
         
         artist = newArtist;
+        
+        // Track data quality score
+        await updateDataQualityScore(
+          "artist",
+          newArtist.id,
+          "spotify",
+          spotifyArtist.popularity ? spotifyArtist.popularity / 100 : 0.5,
+          spotifyArtist.images && spotifyArtist.genres ? 0.8 : 0.5,
+          0.9, // Spotify artist data tends to be accurate
+          { spotify_popularity: spotifyArtist.popularity }
+        );
       } else {
         artist = foundArtist;
       }
@@ -85,7 +106,12 @@ async function processArtist(artistIdentifier: string): Promise<{
       throw new Error(`No Spotify ID found for artist ${artist.id}`);
     }
 
-    console.log(`Processing artist: ${artist.name} (${artist.spotify_id})`);
+    await logSystemEvent(
+      "info", 
+      "process_artist", 
+      `Processing artist: ${artist.name} (${artist.spotify_id})`,
+      { artistId: artist.id, spotifyId: artist.spotify_id }
+    );
     
     // Get all albums from Spotify
     let offset = 0;
@@ -102,7 +128,12 @@ async function processArtist(artistIdentifier: string): Promise<{
       );
       
       if (!albumsResult?.items) {
-        console.log(`No more albums found for artist ${artist.name}`);
+        await logSystemEvent(
+          "info", 
+          "process_artist", 
+          `No more albums found for artist ${artist.name}`,
+          { artistId: artist.id }
+        );
         break;
       }
 
@@ -111,7 +142,12 @@ async function processArtist(artistIdentifier: string): Promise<{
         album.artists[0].id === artist.spotify_id // Artist is the primary artist
       );
       
-      console.log(`Found ${albums.length} albums to process for ${artist.name}`);
+      await logSystemEvent(
+        "info", 
+        "process_artist", 
+        `Found ${albums.length} albums to process for ${artist.name}`,
+        { artistId: artist.id, albumCount: albums.length }
+      );
       
       // Process each album
       for (const album of albums) {
@@ -142,9 +178,26 @@ async function processArtist(artistIdentifier: string): Promise<{
             continue;
           }
           
+          // Update data quality score for the album
+          await updateDataQualityScore(
+            "album",
+            newAlbum.id,
+            "spotify",
+            album.popularity ? album.popularity / 100 : 0.6,
+            album.total_tracks && album.release_date ? 0.8 : 0.6,
+            0.9
+          );
+          
           totalProcessed++;
         } catch (albumError) {
           console.error(`Error processing album ${album.id}:`, albumError);
+          await logProcessingError(
+            "album_processing", 
+            "process_artist", 
+            `Error processing album ${album.id}`,
+            albumError,
+            { albumId: album.id, artistId: artist.id }
+          );
           continue;
         }
       }
@@ -172,7 +225,12 @@ async function processArtist(artistIdentifier: string): Promise<{
       throw batchError;
     }
     
-    console.log(`Created tracks batch ${batch.id} for artist ${artist.name}`);
+    await logSystemEvent(
+      "info", 
+      "process_artist", 
+      `Created tracks batch ${batch.id} for artist ${artist.name}`,
+      { batchId: batch.id, artistId: artist.id }
+    );
     
     return {
       success: true,
@@ -182,16 +240,16 @@ async function processArtist(artistIdentifier: string): Promise<{
   } catch (error) {
     console.error(`Error processing artist ${artistIdentifier}:`, error);
     
-    // Log error to our database
-    await supabase.rpc("log_error", {
-      p_error_type: "processing",
-      p_source: "process_artist",
-      p_message: `Error processing artist`,
-      p_stack_trace: error.stack || "",
-      p_context: { artistIdentifier },
-      p_item_id: artistIdentifier,
-      p_item_type: "artist"
-    });
+    // Log error using our utility function
+    await logProcessingError(
+      "processing",
+      "process_artist",
+      `Error processing artist`,
+      error,
+      { artistIdentifier },
+      artistIdentifier,
+      "artist"
+    );
     
     return {
       success: false,
@@ -240,18 +298,13 @@ serve(async (req) => {
   } catch (error) {
     console.error("Error handling process-artist request:", error);
     
-    // Log error to our database
-    try {
-      await supabase.rpc("log_error", {
-        p_error_type: "endpoint",
-        p_source: "process_artist",
-        p_message: "Error handling process-artist request",
-        p_stack_trace: error.stack || "",
-        p_context: { error: error.message },
-      });
-    } catch (logError) {
-      console.error("Error logging to database:", logError);
-    }
+    // Log error using our utility function
+    await logProcessingError(
+      "endpoint",
+      "process_artist",
+      "Error handling process-artist request",
+      error
+    );
 
     return new Response(
       JSON.stringify({

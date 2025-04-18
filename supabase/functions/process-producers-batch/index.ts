@@ -1,93 +1,21 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
+import { 
+  claimProcessingBatch, 
+  releaseProcessingBatch, 
+  isApiRateLimited, 
+  validateBatchIntegrity,
+  updateItemStatus,
+  calculateBackoff,
+  logSystemEvent
+} from "../lib/pipeline-utils.ts";
 
 // CORS headers for browser access
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
-
-// Calculate backoff time based on retry count with jitter
-function calculateBackoff(retryCount: number, baseDelay = 1000): number {
-  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
-  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
-  
-  // Add random jitter (±25%)
-  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
-  
-  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
-}
-
-// Check if API is rate limited
-async function isApiRateLimited(apiName: string, endpoint: string): Promise<boolean> {
-  try {
-    const { data, error } = await supabase
-      .from("api_rate_limits")
-      .select("*")
-      .eq("api_name", apiName)
-      .eq("endpoint", endpoint)
-      .single();
-    
-    if (error || !data) return false;
-    
-    // If we're out of requests and reset time is in the future
-    if (
-      data.requests_remaining !== null && 
-      data.requests_remaining <= 0 && 
-      data.reset_at && 
-      new Date(data.reset_at) > new Date()
-    ) {
-      return true;
-    }
-    
-    return false;
-  } catch (err) {
-    console.error("Error checking rate limits:", err);
-    return false;
-  }
-}
-
-// Validate batch integrity before processing
-async function validateBatchIntegrity(batchId: string): Promise<{valid: boolean, reason?: string}> {
-  try {
-    // Check if batch exists
-    const { data: batch, error: batchError } = await supabase
-      .from("processing_batches")
-      .select("*")
-      .eq("id", batchId)
-      .single();
-    
-    if (batchError || !batch) {
-      return { valid: false, reason: `Batch ${batchId} not found` };
-    }
-    
-    // Check if batch is in a valid state
-    if (batch.status !== 'pending' && batch.status !== 'processing') {
-      return { valid: false, reason: `Batch ${batchId} is in ${batch.status} state, not processable` };
-    }
-    
-    // Check if there are pending items
-    const { count, error: countError } = await supabase
-      .from("processing_items")
-      .select("*", { count: "exact", head: true })
-      .eq("batch_id", batchId)
-      .eq("status", "pending");
-    
-    if (countError) {
-      return { valid: false, reason: `Error checking pending items: ${countError.message}` };
-    }
-    
-    if (count === 0) {
-      return { valid: false, reason: `No pending items in batch ${batchId}` };
-    }
-    
-    return { valid: true };
-  } catch (err) {
-    console.error("Error validating batch integrity:", err);
-    return { valid: false, reason: `Exception during validation: ${err.message}` };
-  }
-}
 
 // Process a pending producers batch
 async function processProducersBatch(): Promise<{
@@ -117,19 +45,7 @@ async function processProducersBatch(): Promise<{
     }
     
     // Claim a batch to process with soft locking mechanism
-    const { data: batchId, error: claimError } = await supabase.rpc(
-      "claim_processing_batch",
-      {
-        p_batch_type: "process_producers",
-        p_worker_id: workerId,
-        p_claim_ttl_seconds: 3600 // 1 hour claim time
-      }
-    );
-    
-    if (claimError) {
-      console.error("Error claiming batch:", claimError);
-      throw claimError;
-    }
+    const batchId = await claimProcessingBatch("process_producers", workerId, 3600); // 1 hour claim time
     
     if (!batchId) {
       return {
@@ -147,14 +63,7 @@ async function processProducersBatch(): Promise<{
       console.warn(`Batch integrity check failed: ${batchValidation.reason}`);
       
       // Release the batch as it's not valid
-      await supabase.rpc(
-        "release_processing_batch",
-        {
-          p_batch_id: batchId,
-          p_worker_id: workerId,
-          p_status: "error"
-        }
-      );
+      await releaseProcessingBatch(batchId, workerId, "error");
       
       // Update batch with error message
       await supabase
@@ -192,14 +101,7 @@ async function processProducersBatch(): Promise<{
     
     if (!items || items.length === 0) {
       // No items to process, release the batch as completed
-      await supabase.rpc(
-        "release_processing_batch",
-        {
-          p_batch_id: batchId,
-          p_worker_id: workerId,
-          p_status: "completed"
-        }
-      );
+      await releaseProcessingBatch(batchId, workerId, "completed");
       
       return {
         success: true,
@@ -211,7 +113,12 @@ async function processProducersBatch(): Promise<{
       };
     }
     
-    console.log(`Processing ${items.length} tracks for producer identification in batch ${batchId}`);
+    await logSystemEvent(
+      "info",
+      "process_producers_batch",
+      `Processing ${items.length} tracks for producer identification in batch ${batchId}`,
+      { numItems: items.length, batchId }
+    );
     
     const processedItems: string[] = [];
     const failedItems: string[] = [];
@@ -249,13 +156,10 @@ async function processProducersBatch(): Promise<{
     const allDone = !pendingError && pendingItems === 0;
     
     // Release the batch with appropriate status
-    await supabase.rpc(
-      "release_processing_batch",
-      {
-        p_batch_id: batchId,
-        p_worker_id: workerId,
-        p_status: allDone ? "completed" : "processing"
-      }
+    await releaseProcessingBatch(
+      batchId,
+      workerId,
+      allDone ? "completed" : "processing"
     );
     
     // Update batch with accurate progress
@@ -281,14 +185,14 @@ async function processProducersBatch(): Promise<{
   } catch (error) {
     console.error("Error processing producers batch:", error);
     
-    // Log error to our database
-    await supabase.rpc("log_error", {
-      p_error_type: "processing",
-      p_source: "process_producers_batch",
-      p_message: `Error processing producers batch`,
-      p_stack_trace: error.stack || "",
-      p_context: { batchType: "process_producers" }
-    });
+    // Log error using our utility function
+    await logSystemEvent(
+      "error",
+      "process_producers_batch",
+      `Error processing producers batch: ${error.message}`,
+      { error: error.stack || error.message },
+      crypto.randomUUID() // Generate a trace ID
+    );
     
     return {
       success: false,
@@ -337,19 +241,17 @@ async function identifyProducers(
         throw new Error(result.message || "Unknown error identifying producers");
       }
       
-      // Mark item as processed
-      await supabase
-        .from("processing_items")
-        .update({
-          status: "completed",
-          metadata: {
-            ...item.metadata,
-            producers_identified: result.producers?.length || 0,
-            sources: result.sources || [],
-            processed_at: new Date().toISOString()
-          }
-        })
-        .eq("id", item.id);
+      // Mark item as processed using the utility function
+      await updateItemStatus(
+        item.id,
+        "completed",
+        {
+          ...item.metadata,
+          producers_identified: result.producers?.length || 0,
+          sources: result.sources || [],
+          processed_at: new Date().toISOString()
+        }
+      );
       
       processedItems.push(item.id);
       
@@ -363,20 +265,18 @@ async function identifyProducers(
       
       const shouldRetry = (item.retry_count || 0) < 5 && isTransient;
       
-      await supabase
-        .from("processing_items")
-        .update({
-          status: shouldRetry ? "pending" : "error",
-          retry_count: (item.retry_count || 0) + 1,
+      // Update item status using utility function
+      await updateItemStatus(
+        item.id,
+        shouldRetry ? "pending" : "error",
+        {
+          ...item.metadata,
           last_error: error.message,
-          metadata: {
-            ...item.metadata,
-            last_error: error.message,
-            retry_after: shouldRetry ? 
-              new Date(Date.now() + calculateBackoff(item.retry_count || 0)).toISOString() : null
-          }
-        })
-        .eq("id", item.id);
+          retry_after: shouldRetry ? 
+            new Date(Date.now() + calculateBackoff(item.retry_count || 0)).toISOString() : null
+        },
+        error.message
+      );
       
       // Only count as failed if we've given up retrying
       if (!shouldRetry) {
@@ -384,15 +284,12 @@ async function identifyProducers(
       }
       
       // Log specific error
-      await supabase.rpc("log_error", {
-        p_error_type: "processing",
-        p_source: "process_producers_batch",
-        p_message: `Error identifying producers for track ${item.item_id}`,
-        p_stack_trace: error.stack || "",
-        p_context: { item },
-        p_item_id: item.item_id,
-        p_item_type: item.item_type
-      });
+      await logSystemEvent(
+        "error",
+        "process_producers_batch",
+        `Error identifying producers for track ${item.item_id}: ${error.message}`,
+        { item, error: error.stack || error.message }
+      );
     }
   }
 }
@@ -454,18 +351,14 @@ serve(async (req) => {
   } catch (error) {
     console.error("Error handling process-producers-batch request:", error);
     
-    // Log error to our database
-    try {
-      await supabase.rpc("log_error", {
-        p_error_type: "endpoint",
-        p_source: "process_producers_batch",
-        p_message: "Error handling process-producers-batch request",
-        p_stack_trace: error.stack || "",
-        p_context: { error: error.message },
-      });
-    } catch (logError) {
-      console.error("Error logging to database:", logError);
-    }
+    // Log error using the utility function
+    await logSystemEvent(
+      "error",
+      "process_producers_batch",
+      `Error handling process-producers-batch request: ${error.message}`,
+      { error: error.stack || error.message },
+      crypto.randomUUID() // Generate a trace ID
+    );
 
     return new Response(
       JSON.stringify({

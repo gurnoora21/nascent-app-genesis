@@ -1,6 +1,11 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { SpotifyClient, supabase } from "../lib/api-clients.ts";
+import { 
+  logSystemEvent, 
+  logProcessingError,
+  updateItemStatus 
+} from "../lib/pipeline-utils.ts";
 
 // CORS headers for browser access
 const corsHeaders = {
@@ -29,9 +34,22 @@ async function createDiscoveryBatch(options: DiscoverArtistsOptions): Promise<st
       .single();
 
     if (error) throw error;
+    await logSystemEvent(
+      "info", 
+      "discover_artists", 
+      `Created discovery batch for genres: ${options.genres?.join(", ")}`,
+      { options }
+    );
     return data.id;
   } catch (error) {
     console.error("Error creating discovery batch:", error);
+    await logProcessingError(
+      "batch_creation",
+      "discover_artists",
+      "Error creating discovery batch",
+      error,
+      { options }
+    );
     throw error;
   }
 }
@@ -75,6 +93,13 @@ async function addArtistToBatch(
     }
   } catch (error) {
     console.error(`Error adding artist ${spotifyId} to batch:`, error);
+    await logProcessingError(
+      "item_creation",
+      "discover_artists",
+      `Error adding artist ${spotifyId} to batch`,
+      error,
+      { batchId, spotifyId, priority }
+    );
     throw error;
   }
 }
@@ -88,13 +113,13 @@ async function discoverArtistsInGenre(
   minPopularity: number = 40
 ): Promise<number> {
   try {
-    console.log(`Discovering artists in genre: ${genre}`);
+    await logSystemEvent("info", "discover_artists", `Discovering artists in genre: ${genre}`, { genre, maxArtists });
     
     // Search for artists in the genre
     const searchResult = await spotify.searchArtists(`genre:${genre}`, 50);
     
     if (!searchResult?.artists?.items || searchResult.artists.items.length === 0) {
-      console.log(`No artists found for genre: ${genre}`);
+      await logSystemEvent("info", "discover_artists", `No artists found for genre: ${genre}`, { genre });
       return 0;
     }
 
@@ -104,7 +129,7 @@ async function discoverArtistsInGenre(
       .sort((a: any, b: any) => b.popularity - a.popularity)
       .slice(0, maxArtists);
 
-    console.log(`Found ${artists.length} artists for genre: ${genre}`);
+    await logSystemEvent("info", "discover_artists", `Found ${artists.length} artists for genre: ${genre}`, { genre, artistCount: artists.length });
 
     // Process each artist
     for (let i = 0; i < artists.length; i++) {
@@ -154,13 +179,13 @@ async function discoverArtistsInGenre(
     return artists.length;
   } catch (error) {
     console.error(`Error discovering artists in genre ${genre}:`, error);
-    await supabase.rpc("log_error", {
-      p_error_type: "discovery",
-      p_source: "discover_artists",
-      p_message: `Error discovering artists in genre ${genre}`,
-      p_stack_trace: error.stack || "",
-      p_context: { genre },
-    });
+    await logProcessingError(
+      "discovery",
+      "discover_artists",
+      `Error discovering artists in genre ${genre}`,
+      error,
+      { genre, batchId }
+    );
     return 0;
   }
 }
@@ -181,7 +206,12 @@ serve(async (req) => {
     // Create a new batch
     const batchId = await createDiscoveryBatch({ genres, limit, minPopularity, maxArtistsPerGenre });
     
-    console.log(`Created discovery batch ${batchId} for genres: ${genres.join(", ")}`);
+    await logSystemEvent(
+      "info", 
+      "discover_artists", 
+      `Created discovery batch ${batchId} for genres: ${genres.join(", ")}`,
+      { batchId, genres }
+    );
 
     // Process discovery in the background
     EdgeRuntime.waitUntil((async () => {
@@ -245,9 +275,22 @@ serve(async (req) => {
         // Create next batch in pipeline for processing artists
         await createNextBatchInPipeline(batchId, "process_artists");
           
-        console.log(`Discovery batch ${batchId} completed with ${itemsTotal} artists discovered. Created process_artists batch.`);
+        await logSystemEvent(
+          "info", 
+          "discover_artists", 
+          `Discovery batch ${batchId} completed with ${itemsTotal} artists discovered.`,
+          { batchId, itemsTotal }
+        );
       } catch (error) {
         console.error(`Error processing discovery batch ${batchId}:`, error);
+        
+        await logProcessingError(
+          "batch_processing",
+          "discover_artists",
+          `Error processing discovery batch ${batchId}`,
+          error,
+          { batchId }
+        );
         
         // Update batch with error
         await supabase
@@ -277,18 +320,13 @@ serve(async (req) => {
   } catch (error) {
     console.error("Error handling discover-artists request:", error);
     
-    // Log error to our database
-    try {
-      await supabase.rpc("log_error", {
-        p_error_type: "endpoint",
-        p_source: "discover_artists",
-        p_message: "Error handling discover-artists request",
-        p_stack_trace: error.stack || "",
-        p_context: { error: error.message },
-      });
-    } catch (logError) {
-      console.error("Error logging to database:", logError);
-    }
+    // Log error using our utility function
+    await logProcessingError(
+      "endpoint",
+      "discover_artists",
+      "Error handling discover-artists request",
+      error
+    );
 
     return new Response(
       JSON.stringify({
@@ -340,7 +378,12 @@ async function createNextBatchInPipeline(parentBatchId: string, batchType: strin
       return null;
     }
     
-    console.log(`Created next batch in pipeline: ${batchType} with ID ${newBatch.id}`);
+    await logSystemEvent(
+      "info", 
+      "discover_artists", 
+      `Created next batch in pipeline: ${batchType} with ID ${newBatch.id}`,
+      { batchType, newBatchId: newBatch.id, parentBatchId }
+    );
     
     // For process_artists batch, add all processed artists from parent batch as items
     if (batchType === "process_artists") {
@@ -374,7 +417,12 @@ async function createNextBatchInPipeline(parentBatchId: string, batchType: strin
         if (insertError) {
           console.error(`Error creating items for next batch:`, insertError);
         } else {
-          console.log(`Added ${newItems.length} artists to process_artists batch ${newBatch.id}`);
+          await logSystemEvent(
+            "info", 
+            "discover_artists", 
+            `Added ${newItems.length} artists to process_artists batch ${newBatch.id}`,
+            { newBatchId: newBatch.id, itemCount: newItems.length }
+          );
           
           // Update the batch with the accurate total number of items
           await supabase
@@ -390,6 +438,13 @@ async function createNextBatchInPipeline(parentBatchId: string, batchType: strin
     return newBatch.id;
   } catch (error) {
     console.error(`Error creating next batch in pipeline:`, error);
+    await logProcessingError(
+      "batch_creation",
+      "discover_artists",
+      `Error creating next batch in pipeline for ${parentBatchId}`,
+      error,
+      { parentBatchId }
+    );
     return null;
   }
 }
