@@ -9,6 +9,51 @@ export type Json =
 export type Database = {
   public: {
     Tables: {
+      album_labels: {
+        Row: {
+          album_id: string
+          catalog_number: string | null
+          created_at: string
+          id: string
+          label_id: string
+          role: string | null
+          updated_at: string
+        }
+        Insert: {
+          album_id: string
+          catalog_number?: string | null
+          created_at?: string
+          id?: string
+          label_id: string
+          role?: string | null
+          updated_at?: string
+        }
+        Update: {
+          album_id?: string
+          catalog_number?: string | null
+          created_at?: string
+          id?: string
+          label_id?: string
+          role?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "album_labels_album_id_fkey"
+            columns: ["album_id"]
+            isOneToOne: false
+            referencedRelation: "albums"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "album_labels_label_id_fkey"
+            columns: ["label_id"]
+            isOneToOne: false
+            referencedRelation: "labels"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       albums: {
         Row: {
           album_type: string | null
@@ -101,6 +146,51 @@ export type Database = {
         }
         Relationships: []
       }
+      artist_genres: {
+        Row: {
+          artist_id: string
+          confidence: number | null
+          created_at: string
+          genre_id: string
+          id: string
+          source: string
+          updated_at: string
+        }
+        Insert: {
+          artist_id: string
+          confidence?: number | null
+          created_at?: string
+          genre_id: string
+          id?: string
+          source: string
+          updated_at?: string
+        }
+        Update: {
+          artist_id?: string
+          confidence?: number | null
+          created_at?: string
+          genre_id?: string
+          id?: string
+          source?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "artist_genres_artist_id_fkey"
+            columns: ["artist_id"]
+            isOneToOne: false
+            referencedRelation: "artists"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "artist_genres_genre_id_fkey"
+            columns: ["genre_id"]
+            isOneToOne: false
+            referencedRelation: "genres"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       artists: {
         Row: {
           discovered_at: string
@@ -143,6 +233,84 @@ export type Database = {
         }
         Relationships: []
       }
+      attribution_versions: {
+        Row: {
+          changed_by: string | null
+          created_at: string
+          data: Json
+          entity_id: string
+          entity_type: string
+          id: string
+          metadata: Json | null
+          reason: string | null
+          version: number
+        }
+        Insert: {
+          changed_by?: string | null
+          created_at?: string
+          data: Json
+          entity_id: string
+          entity_type: string
+          id?: string
+          metadata?: Json | null
+          reason?: string | null
+          version: number
+        }
+        Update: {
+          changed_by?: string | null
+          created_at?: string
+          data?: Json
+          entity_id?: string
+          entity_type?: string
+          id?: string
+          metadata?: Json | null
+          reason?: string | null
+          version?: number
+        }
+        Relationships: []
+      }
+      data_quality_scores: {
+        Row: {
+          accuracy_score: number | null
+          completeness_score: number | null
+          created_at: string
+          entity_id: string
+          entity_type: string
+          id: string
+          last_verified_at: string | null
+          metadata: Json | null
+          quality_score: number
+          source: string
+          updated_at: string
+        }
+        Insert: {
+          accuracy_score?: number | null
+          completeness_score?: number | null
+          created_at?: string
+          entity_id: string
+          entity_type: string
+          id?: string
+          last_verified_at?: string | null
+          metadata?: Json | null
+          quality_score: number
+          source: string
+          updated_at?: string
+        }
+        Update: {
+          accuracy_score?: number | null
+          completeness_score?: number | null
+          created_at?: string
+          entity_id?: string
+          entity_type?: string
+          id?: string
+          last_verified_at?: string | null
+          metadata?: Json | null
+          quality_score?: number
+          source?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
       error_logs: {
         Row: {
           context: Json | null
@@ -181,6 +349,91 @@ export type Database = {
           stack_trace?: string | null
         }
         Relationships: []
+      }
+      genres: {
+        Row: {
+          created_at: string
+          id: string
+          level: number
+          metadata: Json | null
+          name: string
+          parent_id: string | null
+          updated_at: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          level?: number
+          metadata?: Json | null
+          name: string
+          parent_id?: string | null
+          updated_at?: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          level?: number
+          metadata?: Json | null
+          name?: string
+          parent_id?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "genres_parent_id_fkey"
+            columns: ["parent_id"]
+            isOneToOne: false
+            referencedRelation: "genres"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      labels: {
+        Row: {
+          country: string | null
+          created_at: string
+          discogs_id: string | null
+          founded_year: number | null
+          id: string
+          logo_url: string | null
+          metadata: Json | null
+          name: string
+          parent_label_id: string | null
+          updated_at: string
+        }
+        Insert: {
+          country?: string | null
+          created_at?: string
+          discogs_id?: string | null
+          founded_year?: number | null
+          id?: string
+          logo_url?: string | null
+          metadata?: Json | null
+          name: string
+          parent_label_id?: string | null
+          updated_at?: string
+        }
+        Update: {
+          country?: string | null
+          created_at?: string
+          discogs_id?: string | null
+          founded_year?: number | null
+          id?: string
+          logo_url?: string | null
+          metadata?: Json | null
+          name?: string
+          parent_label_id?: string | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "labels_parent_label_id_fkey"
+            columns: ["parent_label_id"]
+            isOneToOne: false
+            referencedRelation: "labels"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       processing_batches: {
         Row: {
@@ -283,6 +536,111 @@ export type Database = {
           },
         ]
       }
+      producer_albums: {
+        Row: {
+          album_id: string
+          confidence: Database["public"]["Enums"]["confidence_level"]
+          created_at: string
+          id: string
+          metadata: Json | null
+          producer_id: string
+          role: string | null
+          source: string
+          updated_at: string
+        }
+        Insert: {
+          album_id: string
+          confidence?: Database["public"]["Enums"]["confidence_level"]
+          created_at?: string
+          id?: string
+          metadata?: Json | null
+          producer_id: string
+          role?: string | null
+          source: string
+          updated_at?: string
+        }
+        Update: {
+          album_id?: string
+          confidence?: Database["public"]["Enums"]["confidence_level"]
+          created_at?: string
+          id?: string
+          metadata?: Json | null
+          producer_id?: string
+          role?: string | null
+          source?: string
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "producer_albums_album_id_fkey"
+            columns: ["album_id"]
+            isOneToOne: false
+            referencedRelation: "albums"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "producer_albums_producer_id_fkey"
+            columns: ["producer_id"]
+            isOneToOne: false
+            referencedRelation: "producers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      producer_artists: {
+        Row: {
+          artist_id: string
+          created_at: string
+          first_collaboration_date: string | null
+          id: string
+          is_frequent_collaborator: boolean | null
+          metadata: Json | null
+          producer_id: string
+          total_albums: number | null
+          total_tracks: number | null
+          updated_at: string
+        }
+        Insert: {
+          artist_id: string
+          created_at?: string
+          first_collaboration_date?: string | null
+          id?: string
+          is_frequent_collaborator?: boolean | null
+          metadata?: Json | null
+          producer_id: string
+          total_albums?: number | null
+          total_tracks?: number | null
+          updated_at?: string
+        }
+        Update: {
+          artist_id?: string
+          created_at?: string
+          first_collaboration_date?: string | null
+          id?: string
+          is_frequent_collaborator?: boolean | null
+          metadata?: Json | null
+          producer_id?: string
+          total_albums?: number | null
+          total_tracks?: number | null
+          updated_at?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "producer_artists_artist_id_fkey"
+            columns: ["artist_id"]
+            isOneToOne: false
+            referencedRelation: "artists"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "producer_artists_producer_id_fkey"
+            columns: ["producer_id"]
+            isOneToOne: false
+            referencedRelation: "producers"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       producers: {
         Row: {
           aliases: string[] | null
@@ -319,6 +677,36 @@ export type Database = {
           name?: string
           spotify_id?: string | null
           updated_at?: string
+        }
+        Relationships: []
+      }
+      system_logs: {
+        Row: {
+          component: string
+          context: Json | null
+          created_at: string
+          id: string
+          log_level: string
+          message: string
+          trace_id: string | null
+        }
+        Insert: {
+          component: string
+          context?: Json | null
+          created_at?: string
+          id?: string
+          log_level: string
+          message: string
+          trace_id?: string | null
+        }
+        Update: {
+          component?: string
+          context?: Json | null
+          created_at?: string
+          id?: string
+          log_level?: string
+          message?: string
+          trace_id?: string | null
         }
         Relationships: []
       }
@@ -506,6 +894,36 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      worker_heartbeats: {
+        Row: {
+          current_batch_id: string | null
+          id: string
+          last_heartbeat: string
+          metadata: Json | null
+          status: string
+          worker_id: string
+          worker_type: string
+        }
+        Insert: {
+          current_batch_id?: string | null
+          id?: string
+          last_heartbeat?: string
+          metadata?: Json | null
+          status?: string
+          worker_id: string
+          worker_type: string
+        }
+        Update: {
+          current_batch_id?: string | null
+          id?: string
+          last_heartbeat?: string
+          metadata?: Json | null
+          status?: string
+          worker_id?: string
+          worker_type?: string
+        }
+        Relationships: []
       }
     }
     Views: {
