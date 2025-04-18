@@ -112,100 +112,174 @@ async function processArtist(artistIdentifier: string, isTestMode = false): Prom
       { artistId: artist.id, spotifyId: artist.spotify_id }
     );
     
-    // Get all albums from Spotify
-    let offset = 0;
-    const limit = 50;
-    let totalProcessed = 0;
-    let hasMore = true;
+    // If API is rate limited, check if we can use existing albums for test mode
     let processedAlbumIds: string[] = [];
+    let totalProcessed = 0;
+    let apiRateLimited = false;
     
-    while (hasMore) {
-      const albumsResult = await spotify.getArtistAlbums(
-        artist.spotify_id,
-        limit,
-        offset,
-        "album,single,ep" // Explicitly exclude compilations and appears_on
-      );
-      
-      if (!albumsResult?.items) {
-        await logSystemEvent(
-          "info", 
-          "process_artist", 
-          `No more albums found for artist ${artist.name}`,
-          { artistId: artist.id }
-        );
-        break;
-      }
-
-      const albums = albumsResult.items.filter(album => 
-        // Additional filtering to ensure clean data
-        album.artists[0].id === artist.spotify_id // Artist is the primary artist
-      );
-      
-      await logSystemEvent(
-        "info", 
-        "process_artist", 
-        `Found ${albums.length} albums to process for ${artist.name}`,
-        { artistId: artist.id, albumCount: albums.length }
-      );
-      
-      // Process each album
-      for (const album of albums) {
-        try {
-          // Store album in our database
-          const { data: newAlbum, error: albumError } = await supabase
-            .from("albums")
-            .upsert({
-              spotify_id: album.id,
-              name: album.name,
-              artist_id: artist.id,
-              album_type: album.album_type,
-              release_date: album.release_date,
-              total_tracks: album.total_tracks,
-              spotify_url: album.external_urls?.spotify,
-              image_url: album.images?.[0]?.url,
-              popularity: album.popularity,
-              is_primary_artist_album: true,
-              metadata: {
-                spotify: album
-              }
-            })
-            .select("id")
-            .single();
-          
-          if (albumError) {
-            console.error(`Error storing album ${album.id}:`, albumError);
-            continue;
-          }
-
-          processedAlbumIds.push(newAlbum.id);
-          
-          // Update data quality score for the album
-          await updateDataQualityScore(
-            "album",
-            newAlbum.id,
-            "spotify",
-            album.popularity ? album.popularity / 100 : 0.6,
-            album.total_tracks && album.release_date ? 0.8 : 0.6,
-            0.9
-          );
-          
-          totalProcessed++;
-        } catch (albumError) {
-          console.error(`Error processing album ${album.id}:`, albumError);
-          await logProcessingError(
-            "album_processing", 
-            "process_artist", 
-            `Error processing album ${album.id}`,
-            albumError,
-            { albumId: album.id, artistId: artist.id }
-          );
-          continue;
+    try {
+      // Check if we have existing albums for this artist that we can use
+      if (isTestMode) {
+        console.log(`Checking for existing albums for artist ${artist.id} (${artist.name})`);
+        const { data: existingAlbums, error: albumsError } = await supabase
+          .from("albums")
+          .select("id")
+          .eq("artist_id", artist.id)
+          .eq("is_primary_artist_album", true)
+          .limit(10);
+        
+        if (!albumsError && existingAlbums && existingAlbums.length > 0) {
+          processedAlbumIds = existingAlbums.map(album => album.id);
+          totalProcessed = processedAlbumIds.length;
+          console.log(`Found ${totalProcessed} existing albums for ${artist.name} to use for test mode`);
+        } else if (albumsError) {
+          console.error(`Error fetching existing albums for artist ${artist.id}:`, albumsError);
         }
       }
+    } catch (error) {
+      console.error(`Error checking existing albums for artist ${artist.id}:`, error);
+    }
+    
+    // Try to get albums from Spotify if we don't have any yet or if this is not test mode
+    if (!isTestMode || processedAlbumIds.length === 0) {
+      // Get all albums from Spotify
+      let offset = 0;
+      const limit = 50;
+      let hasMore = true;
       
-      offset += limit;
-      hasMore = albumsResult.next !== null;
+      try {
+        while (hasMore) {
+          try {
+            const albumsResult = await spotify.getArtistAlbums(
+              artist.spotify_id,
+              limit,
+              offset,
+              "album,single,ep" // Explicitly exclude compilations and appears_on
+            );
+            
+            if (!albumsResult?.items) {
+              await logSystemEvent(
+                "info", 
+                "process_artist", 
+                `No more albums found for artist ${artist.name}`,
+                { artistId: artist.id }
+              );
+              break;
+            }
+
+            const albums = albumsResult.items.filter(album => 
+              // Additional filtering to ensure clean data
+              album.artists[0].id === artist.spotify_id // Artist is the primary artist
+            );
+            
+            await logSystemEvent(
+              "info", 
+              "process_artist", 
+              `Found ${albums.length} albums to process for ${artist.name}`,
+              { artistId: artist.id, albumCount: albums.length }
+            );
+            
+            // Process each album
+            for (const album of albums) {
+              try {
+                // Store album in our database
+                const { data: newAlbum, error: albumError } = await supabase
+                  .from("albums")
+                  .upsert({
+                    spotify_id: album.id,
+                    name: album.name,
+                    artist_id: artist.id,
+                    album_type: album.album_type,
+                    release_date: album.release_date,
+                    total_tracks: album.total_tracks,
+                    spotify_url: album.external_urls?.spotify,
+                    image_url: album.images?.[0]?.url,
+                    popularity: album.popularity,
+                    is_primary_artist_album: true,
+                    metadata: {
+                      spotify: album
+                    }
+                  })
+                  .select("id")
+                  .single();
+                
+                if (albumError) {
+                  console.error(`Error storing album ${album.id}:`, albumError);
+                  continue;
+                }
+
+                processedAlbumIds.push(newAlbum.id);
+                
+                // Update data quality score for the album
+                await updateDataQualityScore(
+                  "album",
+                  newAlbum.id,
+                  "spotify",
+                  album.popularity ? album.popularity / 100 : 0.6,
+                  album.total_tracks && album.release_date ? 0.8 : 0.6,
+                  0.9
+                );
+                
+                totalProcessed++;
+              } catch (albumError) {
+                console.error(`Error processing album ${album.id}:`, albumError);
+                await logProcessingError(
+                  "album_processing", 
+                  "process_artist", 
+                  `Error processing album ${album.id}`,
+                  albumError,
+                  { albumId: album.id, artistId: artist.id }
+                );
+                continue;
+              }
+            }
+            
+            offset += limit;
+            hasMore = albumsResult.next !== null;
+          } catch (fetchError) {
+            console.error(`Error fetching albums for artist ${artist.spotify_id}:`, fetchError);
+            
+            // Check if this is a rate limit error
+            if (fetchError.message && (
+                fetchError.message.includes("rate limit") || 
+                fetchError.message.includes("Too many requests")
+              )) {
+              apiRateLimited = true;
+              await logSystemEvent(
+                "warning", 
+                "process_artist", 
+                `Spotify API rate limited while processing artist ${artist.name}`,
+                { artistId: artist.id, spotifyId: artist.spotify_id }
+              );
+              
+              // In test mode, we might have some albums already, so we can continue
+              // Otherwise, we should stop and report the error
+              if (!isTestMode || processedAlbumIds.length === 0) {
+                throw fetchError;
+              } else {
+                console.log(`Using ${processedAlbumIds.length} albums already processed for test mode despite rate limiting`);
+                break;
+              }
+            } else {
+              throw fetchError;
+            }
+          }
+        }
+      } catch (albumsError) {
+        if (!apiRateLimited || processedAlbumIds.length === 0) {
+          await logProcessingError(
+            "albums_fetch", 
+            "process_artist", 
+            `Error fetching albums for artist ${artist.name}`,
+            albumsError,
+            { artistId: artist.id, spotifyId: artist.spotify_id }
+          );
+          
+          if (!isTestMode) {
+            throw albumsError;
+          }
+        }
+      }
     }
     
     // Create a batch for processing the artist's tracks
@@ -255,9 +329,14 @@ async function processArtist(artistIdentifier: string, isTestMode = false): Prom
       );
     }
     
+    let message = `Processed ${totalProcessed} albums for artist ${artist.name}`;
+    if (apiRateLimited) {
+      message += " (API rate limited, used existing albums)";
+    }
+    
     return {
       success: true,
-      message: `Processed ${totalProcessed} albums for artist ${artist.name}`,
+      message,
       processedAlbums: totalProcessed
     };
   } catch (error) {
@@ -276,7 +355,8 @@ async function processArtist(artistIdentifier: string, isTestMode = false): Prom
     
     return {
       success: false,
-      message: `Error processing artist: ${error.message}`
+      message: `Error processing artist: ${error.message}`,
+      processedAlbums: 0
     };
   }
 }
