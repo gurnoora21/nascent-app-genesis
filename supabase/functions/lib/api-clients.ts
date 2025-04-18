@@ -1,3 +1,4 @@
+
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 const SUPABASE_URL = "https://nsxxzhhbcwzatvlulfyp.supabase.co";
@@ -69,9 +70,21 @@ export class ApiRateLimiter {
         const secondsUntilReset = Math.ceil(
           (new Date(data.reset_at).getTime() - Date.now()) / 1000
         );
+        
+        // Check if it's been at least 5 minutes since our last check
+        // This helps avoid being stuck in a permanent rate-limited state due to stale data
+        const lastUpdatedTime = new Date(data.updated_at).getTime();
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        
+        if (lastUpdatedTime < fiveMinutesAgo) {
+          // It's been more than 5 minutes, let's try again
+          await this.resetRateLimit();
+          return { limited: false };
+        }
+        
         return { 
           limited: true, 
-          retryAfter: Math.min(secondsUntilReset, 30) // Cap at 30 seconds
+          retryAfter: secondsUntilReset
         };
       }
 
@@ -102,6 +115,8 @@ export class ApiRateLimiter {
         remaining = 0; // We're rate limited
         const retryAfterSeconds = parseInt(headers.get("retry-after") || "1");
         resetAt = new Date(Date.now() + retryAfterSeconds * 1000).toISOString();
+        
+        console.warn(`Rate limited by ${this.apiName} for ${retryAfterSeconds} seconds until ${resetAt}`);
       }
       // Genius format
       else if (headers.get("x-ratelimit-limit")) {
@@ -145,8 +160,8 @@ export class ApiRateLimiter {
     }
   }
 
-  // Reset rate limit info
-  private async resetRateLimit(): Promise<void> {
+  // Reset rate limit info - now public so it can be called externally
+  async resetRateLimit(): Promise<void> {
     try {
       const { error } = await supabase
         .from("api_rate_limits")
@@ -160,9 +175,71 @@ export class ApiRateLimiter {
 
       if (error) {
         console.error("Error resetting rate limit:", error);
+      } else {
+        console.log(`Successfully reset rate limits for ${this.apiName}:${this.endpoint}`);
       }
     } catch (err) {
       console.error("Error in resetRateLimit:", err);
+    }
+  }
+}
+
+/**
+ * Utility for concurrency limiting
+ */
+export class ConcurrencyLimiter {
+  private queue: Array<() => Promise<void>> = [];
+  private running = 0;
+  private concurrency: number;
+
+  constructor(concurrency = 2) {
+    this.concurrency = concurrency;
+  }
+
+  async add<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        this.running++;
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        } finally {
+          this.running--;
+          this.next();
+        }
+      };
+
+      this.queue.push(run);
+      
+      if (this.running < this.concurrency) {
+        this.next();
+      }
+    });
+  }
+
+  private next() {
+    if (this.queue.length > 0 && this.running < this.concurrency) {
+      const fn = this.queue.shift();
+      if (fn) fn();
+    }
+  }
+
+  get activeCount(): number {
+    return this.running;
+  }
+
+  get pendingCount(): number {
+    return this.queue.length;
+  }
+
+  setConcurrency(limit: number): void {
+    this.concurrency = Math.max(1, limit);
+    
+    // Start processing more items if we raised the limit
+    while (this.running < this.concurrency && this.queue.length > 0) {
+      this.next();
     }
   }
 }
@@ -183,8 +260,26 @@ export class RetryHelper {
     while (true) {
       try {
         return await operation();
-      } catch (error) {
+      } catch (error: any) {
         attempt++;
+        
+        // Special handling for rate limiting (429 status)
+        if (error.status === 429 && error.headers) {
+          const retryAfterHeader = error.headers.get("Retry-After");
+          if (retryAfterHeader) {
+            const retryAfterSeconds = parseInt(retryAfterHeader, 10);
+            const retryAfterMs = retryAfterSeconds * 1000;
+            
+            console.warn(`Rate limited! Waiting for Retry-After period: ${retryAfterSeconds} seconds`);
+            
+            // Honor the full Retry-After duration from Spotify
+            await new Promise(resolve => setTimeout(resolve, retryAfterMs));
+            
+            // Attempt to retry immediately after waiting
+            console.log(`Resuming after rate limit wait period`);
+            continue;
+          }
+        }
         
         // Check if we should retry based on error type
         if (isRetryable && !isRetryable(error)) {
@@ -217,19 +312,36 @@ export class SpotifyClient {
   private tokenExpiry: Date | null = null;
   private clientId: string;
   private clientSecret: string;
-  private requestThrottleMs: number = 200; // Default throttle between requests
+  private requestThrottleMs: number = 1000; // Increased default throttle
   private cacheEnabled: boolean = true;
+  private concurrencyLimiter: ConcurrencyLimiter;
+  private rateLimitedCount: number = 0;
+  private lastRateLimitReset: number = Date.now();
+  private adaptiveThrottlingEnabled: boolean = true;
 
-  constructor(throttleMs = 200, enableCache = true) {
+  constructor(throttleMs = 1000, enableCache = true, concurrency = 2) {
     this.clientId = Deno.env.get("SPOTIFY_CLIENT_ID") || "";
     this.clientSecret = Deno.env.get("SPOTIFY_CLIENT_SECRET") || "";
     this.requestThrottleMs = throttleMs;
     this.cacheEnabled = enableCache;
+    this.concurrencyLimiter = new ConcurrencyLimiter(concurrency);
   }
 
   // Set throttle time between requests
   setThrottle(milliseconds: number): void {
+    console.log(`Throttle time changed from ${this.requestThrottleMs}ms to ${milliseconds}ms`);
     this.requestThrottleMs = milliseconds;
+  }
+
+  // Enable or disable adaptive throttling
+  setAdaptiveThrottling(enabled: boolean): void {
+    this.adaptiveThrottlingEnabled = enabled;
+  }
+
+  // Set concurrency limit
+  setConcurrency(limit: number): void {
+    console.log(`Concurrency limit changed from ${this.concurrencyLimiter.activeCount} to ${limit}`);
+    this.concurrencyLimiter.setConcurrency(limit);
   }
 
   // Enable or disable caching
@@ -273,113 +385,156 @@ export class SpotifyClient {
     }
   }
 
-  // Make authenticated request to Spotify API with retry and rate limit handling
-  async makeRequest(endpoint: string, method = "GET", body?: any, cacheKey?: string): Promise<any> {
-    const rateLimiter = new ApiRateLimiter("spotify", endpoint);
+  // Check and potentially adjust throttle based on rate limit encounters
+  private adjustThrottleIfNeeded(): void {
+    if (!this.adaptiveThrottlingEnabled) return;
     
-    // Try to get from cache first if enabled and a cache key is provided
-    if (this.cacheEnabled && cacheKey) {
-      const cachedData = rateLimiter.getCachedData(cacheKey);
-      if (cachedData) {
-        console.log(`Using cached data for ${endpoint} with key ${cacheKey}`);
-        return cachedData;
+    // Check if it's been over 5 minutes since our last reset
+    const now = Date.now();
+    if (now - this.lastRateLimitReset > 5 * 60 * 1000) {
+      this.rateLimitedCount = 0;
+      this.lastRateLimitReset = now;
+    }
+    
+    // If we've seen multiple rate limits recently, increase the throttle
+    if (this.rateLimitedCount > 2) {
+      const newThrottle = Math.min(this.requestThrottleMs * 1.5, 5000);
+      if (newThrottle > this.requestThrottleMs) {
+        console.log(`Adaptive throttling: Increasing throttle to ${newThrottle}ms after ${this.rateLimitedCount} rate limits`);
+        this.requestThrottleMs = newThrottle;
+        
+        // Also reduce concurrency if we're getting rate limited frequently
+        if (this.concurrencyLimiter.activeCount > 1) {
+          this.concurrencyLimiter.setConcurrency(1);
+          console.log("Adaptive throttling: Reducing concurrency to 1");
+        }
       }
     }
-    
-    // Check if we're rate limited
-    const rateLimitStatus = await rateLimiter.isRateLimited();
-    if (rateLimitStatus.limited) {
-      console.warn(`Rate limited for Spotify API endpoint: ${endpoint}. Retry after ${rateLimitStatus.retryAfter || 0} seconds.`);
-      throw new Error(`Rate limited for Spotify API endpoint: ${endpoint}. Retry after ${rateLimitStatus.retryAfter || 0} seconds.`);
-    }
+  }
 
-    // Throttle requests to avoid hitting rate limits
-    await new Promise(resolve => setTimeout(resolve, this.requestThrottleMs));
-
-    try {
-      const isRetryable = (error: any) => {
-        // Retry on network errors and 5xx server errors
-        if (error.message && (
-            error.message.includes('network') || 
-            error.message.includes('timeout') ||
-            error.message.includes('500') || 
-            error.message.includes('503')
-        )) {
-          return true;
-        }
-        
-        // Don't retry on 4xx client errors except 429 (rate limit)
-        if (error.status && error.status !== 429 && error.status < 500 && error.status >= 400) {
-          return false;
-        }
-        
-        return true;
-      };
+  // Make authenticated request to Spotify API with retry and rate limit handling
+  async makeRequest(endpoint: string, method = "GET", body?: any, cacheKey?: string): Promise<any> {
+    // Wrap the request in our concurrency limiter
+    return this.concurrencyLimiter.add(async () => {
+      const rateLimiter = new ApiRateLimiter("spotify", endpoint);
       
-      return await RetryHelper.retryOperation(async () => {
-        const token = await this.getAccessToken();
+      // Try to get from cache first if enabled and a cache key is provided
+      if (this.cacheEnabled && cacheKey) {
+        const cachedData = rateLimiter.getCachedData(cacheKey);
+        if (cachedData) {
+          console.log(`Using cached data for ${endpoint} with key ${cacheKey}`);
+          return cachedData;
+        }
+      }
+      
+      // Check if we're rate limited
+      const rateLimitStatus = await rateLimiter.isRateLimited();
+      if (rateLimitStatus.limited) {
+        const retryAfter = rateLimitStatus.retryAfter || 30;
+        console.warn(`Rate limited for Spotify API endpoint: ${endpoint}. Waiting ${retryAfter} seconds before retry.`);
         
-        const options: RequestInit = {
-          method,
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
+        // Wait the full retry period
+        await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+        
+        // Reset the rate limit entry to avoid getting stuck
+        await rateLimiter.resetRateLimit();
+        
+        // Try again (recursively) after waiting
+        return this.makeRequest(endpoint, method, body, cacheKey);
+      }
+      
+      // Throttle requests to avoid hitting rate limits
+      await new Promise(resolve => setTimeout(resolve, this.requestThrottleMs));
+      
+      try {
+        const isRetryable = (error: any) => {
+          // Retry on network errors and 5xx server errors
+          if (error.message && (
+              error.message.includes('network') || 
+              error.message.includes('timeout') ||
+              error.message.includes('500') || 
+              error.message.includes('503')
+          )) {
+            return true;
+          }
+          
+          // Don't retry on 4xx client errors except 429 (rate limit)
+          if (error.status && error.status !== 429 && error.status < 500 && error.status >= 400) {
+            return false;
+          }
+          
+          return true;
         };
-
-        if (body) {
-          options.body = JSON.stringify(body);
-        }
-
-        const response = await fetch(`https://api.spotify.com/v1${endpoint}`, options);
         
-        // Handle rate limiting before we parse the response
-        if (response.status === 429) {
-          // Get retry-after header
-          const retryAfter = parseInt(response.headers.get("Retry-After") || "1");
-          const error: any = new Error(`Spotify rate limit exceeded. Retry after ${retryAfter} seconds.`);
-          error.status = 429;
-          error.headers = response.headers;
+        return await RetryHelper.retryOperation(async () => {
+          const token = await this.getAccessToken();
           
-          // Update rate limit tracking
-          await rateLimiter.updateRateLimit(response.headers, { error: "Rate limited" });
+          const options: RequestInit = {
+            method,
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "Content-Type": "application/json",
+            },
+          };
+
+          if (body) {
+            options.body = JSON.stringify(body);
+          }
+
+          const response = await fetch(`https://api.spotify.com/v1${endpoint}`, options);
           
-          throw error;
-        }
-        
-        let data;
-        try {
-          data = await response.json();
-        } catch (jsonError) {
-          console.error(`Error parsing JSON from Spotify API ${endpoint}:`, jsonError);
-          throw new Error(`Failed to parse Spotify API response as JSON: ${jsonError.message}`);
-        }
+          // Handle rate limiting before we parse the response
+          if (response.status === 429) {
+            // Get retry-after header
+            const retryAfter = parseInt(response.headers.get("Retry-After") || "1");
+            const error: any = new Error(`Spotify rate limit exceeded. Retry after ${retryAfter} seconds.`);
+            error.status = 429;
+            error.headers = response.headers;
+            
+            // Update rate limit tracking
+            await rateLimiter.updateRateLimit(response.headers, { error: "Rate limited" });
+            
+            // Record that we encountered a rate limit for adaptive throttling
+            this.rateLimitedCount++;
+            this.adjustThrottleIfNeeded();
+            
+            throw error;
+          }
+          
+          let data;
+          try {
+            data = await response.json();
+          } catch (jsonError) {
+            console.error(`Error parsing JSON from Spotify API ${endpoint}:`, jsonError);
+            throw new Error(`Failed to parse Spotify API response as JSON: ${jsonError.message}`);
+          }
 
-        // Update rate limit info
-        await rateLimiter.updateRateLimit(response.headers, data);
+          // Update rate limit info
+          await rateLimiter.updateRateLimit(response.headers, data);
 
-        if (!response.ok) {
-          const error: any = new Error(`Spotify API error: ${JSON.stringify(data)}`);
-          error.status = response.status;
-          error.headers = response.headers;
-          throw error;
-        }
+          if (!response.ok) {
+            const error: any = new Error(`Spotify API error: ${JSON.stringify(data)}`);
+            error.status = response.status;
+            error.headers = response.headers;
+            throw error;
+          }
 
-        // Store in cache if caching is enabled and we have a cache key
-        if (this.cacheEnabled && cacheKey) {
-          rateLimiter.setCachedData(cacheKey, data);
-        }
-        
-        // Log the successful response for debugging
-        console.log(`Spotify API ${endpoint} response status: ${response.status}`);
-        
-        return data;
-      }, 3, 2000, `Spotify API call to ${endpoint}`, isRetryable);
-    } catch (error) {
-      console.error(`Error calling Spotify API ${endpoint}:`, error);
-      await this.logError("api", `Error calling Spotify API ${endpoint}`, error);
-      throw error;
-    }
+          // Store in cache if caching is enabled and we have a cache key
+          if (this.cacheEnabled && cacheKey) {
+            rateLimiter.setCachedData(cacheKey, data);
+          }
+          
+          // Log the successful response for debugging
+          console.log(`Spotify API ${endpoint} response status: ${response.status}`);
+          
+          return data;
+        }, 3, 2000, `Spotify API call to ${endpoint}`, isRetryable);
+      } catch (error) {
+        console.error(`Error calling Spotify API ${endpoint}:`, error);
+        await this.logError("api", `Error calling Spotify API ${endpoint}`, error);
+        throw error;
+      }
+    });
   }
 
   // Search for artists by name or genre with improved caching
@@ -417,7 +572,7 @@ export class SpotifyClient {
     return result;
   }
 
-  // Get artist's albums with efficient batching and caching
+  // Get artist's albums with efficient batching, caching, and sequential processing
   async getArtistAlbums(
     id: string, 
     limit = 50, 
@@ -458,6 +613,45 @@ export class SpotifyClient {
       // Return a valid but empty response structure on error
       return { items: [], total: 0, next: null };
     }
+  }
+
+  // Get all artist albums with pagination handling
+  async getAllArtistAlbums(
+    id: string, 
+    include_groups = "album,single,compilation,appears_on"
+  ): Promise<any[]> {
+    let allAlbums: any[] = [];
+    let offset = 0;
+    const limit = 50; // Maximum allowed by Spotify API
+    let hasMore = true;
+    
+    console.log(`Fetching all albums for artist ${id}`);
+    
+    while (hasMore) {
+      console.log(`Fetching albums batch at offset ${offset}`);
+      
+      const result = await this.getArtistAlbums(id, limit, offset, include_groups);
+      
+      if (!result.items || !result.items.length) {
+        hasMore = false;
+        break;
+      }
+      
+      allAlbums = [...allAlbums, ...result.items];
+      console.log(`Retrieved ${result.items.length} albums, total so far: ${allAlbums.length}`);
+      
+      if (!result.next) {
+        hasMore = false;
+      } else {
+        offset += limit;
+      }
+      
+      // Add a small delay between paginated requests to avoid rate limits
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    console.log(`Completed fetching all ${allAlbums.length} albums for artist ${id}`);
+    return allAlbums;
   }
 
   // Get album details
@@ -533,6 +727,11 @@ export class SpotifyClient {
           cacheKey
         )
       );
+      
+      // Add delay between batches to avoid rate limits
+      if (i + batchSize < ids.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
     }
     
     const results = await Promise.all(batches);
