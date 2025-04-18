@@ -33,64 +33,79 @@ export function formatSpotifyReleaseDate(releaseDate: string | null): string | n
   }
 }
 
-// Determine if an error is transient (retryable) or permanent
-export function isTransientError(error: Error): boolean {
-  // Network errors, timeouts, and rate limiting are usually transient
-  const transientErrorPatterns = [
-    /network/i,
-    /timeout/i,
-    /rate limit/i,
-    /429/,
-    /503/,
-    /504/,
-    /connection/i,
-    /temporarily unavailable/i,
-    /too many requests/i
-  ];
-  
-  const errorString = error.message + (error.stack || '');
-  
-  return transientErrorPatterns.some(pattern => pattern.test(errorString));
-}
-
-// Calculate backoff time based on retry count with jitter
-export function calculateBackoff(retryCount: number, baseDelay = 1000): number {
-  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
-  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
-  
-  // Add random jitter (±25%)
-  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
-  
-  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
-}
-
-// Process an artist with test mode option
+// Process an artist through the batch system
 export async function processArtist(artistId: string, isTestMode = false): Promise<{
   success: boolean;
   message: string;
-  processedAlbums?: number;
 }> {
   try {
-    const { data, error } = await supabase.functions.invoke("process-artist", {
-      body: { artistId, isTestMode },
-    });
+    // Create a new processing batch
+    const { data: batch, error: batchError } = await supabase
+      .from("processing_batches")
+      .insert({
+        batch_type: "process_artists",
+        status: "pending",
+        metadata: {
+          is_test_mode: isTestMode,
+          created_from_client: true
+        }
+      })
+      .select("id")
+      .single();
     
-    if (error) {
-      console.error('Error calling process-artist function:', error);
+    if (batchError) {
+      console.error('Error creating processing batch:', batchError);
       return {
         success: false,
-        message: `Error: ${error.message}`,
-        processedAlbums: 0
+        message: `Error: ${batchError.message}`,
       };
     }
     
-    return data;
+    // Add the artist to the batch
+    const { error: itemError } = await supabase
+      .from("processing_items")
+      .insert({
+        batch_id: batch.id,
+        item_type: "artist",
+        item_id: artistId,
+        status: "pending",
+        priority: 10, // High priority for manual requests
+        metadata: {
+          is_test_mode: isTestMode,
+          requested_at: new Date().toISOString()
+        }
+      });
+    
+    if (itemError) {
+      console.error('Error adding artist to batch:', itemError);
+      return {
+        success: false,
+        message: `Error: ${itemError.message}`,
+      };
+    }
+    
+    // Trigger the processing function
+    const { data, error } = await supabase.functions.invoke("process-artists-batch", {
+      body: {},
+    });
+    
+    if (error) {
+      console.error('Error calling process-artists-batch function:', error);
+      return {
+        success: false,
+        message: `Error: ${error.message}`,
+      };
+    }
+    
+    return {
+      success: true,
+      message: `Artist processing initiated. Batch ID: ${batch.id}`
+    };
   } catch (error) {
     console.error('Error in processArtist:', error);
     return {
       success: false,
       message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`,
-      processedAlbums: 0
     };
   }
 }
