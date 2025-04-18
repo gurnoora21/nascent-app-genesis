@@ -1,6 +1,5 @@
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
-import { formatSpotifyReleaseDate } from "../../integrations/supabase/client.ts";
 
 // CORS headers for browser access
 const corsHeaders = {
