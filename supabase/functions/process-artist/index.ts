@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { SpotifyClient, supabase } from "../lib/api-clients.ts";
 import { 
@@ -104,118 +103,102 @@ async function processArtist(artistIdentifier: string, isTestMode = false): Prom
     let processedAlbumIds = existingAlbums?.map(album => album.id) || [];
     console.log(`Found ${processedAlbumIds.length} existing albums for ${artist.name}`);
     
-    // Get new albums from Spotify if needed
-    if (!isTestMode || processedAlbumIds.length === 0) {
-      try {
-        // Set reasonable batch size
-        const limit = isTestMode ? 3 : 20;
-        let offset = 0;
-        let hasMore = true;
-        
-        while (hasMore && (!isTestMode || processedAlbumIds.length < 3)) {
-          const albumsResult = await spotify.getArtistAlbums(
-            artist.spotify_id,
-            limit,
-            offset,
-            "album,single,ep"
-          );
-          
-          if (!albumsResult?.items?.length) break;
-          
-          // Filter for primary artist albums
-          const albums = albumsResult.items.filter(album => 
-            album.artists[0].id === artist.spotify_id
-          );
-          
-          console.log(`Processing ${albums.length} albums for ${artist.name}`);
-          
-          for (const album of albums) {
-            // Check if we already have this album
-            const { data: existingAlbum } = await supabase
-              .from("albums")
-              .select("id")
-              .eq("spotify_id", album.id)
-              .maybeSingle();
-            
-            if (existingAlbum) {
-              processedAlbumIds.push(existingAlbum.id);
-              continue;
-            }
-            
-            // Store new album
-            const { data: newAlbum, error: albumError } = await supabase
-              .from("albums")
-              .insert({
-                spotify_id: album.id,
-                name: album.name,
-                artist_id: artist.id,
-                album_type: album.album_type,
-                release_date: album.release_date,
-                total_tracks: album.total_tracks,
-                spotify_url: album.external_urls?.spotify,
-                image_url: album.images?.[0]?.url,
-                popularity: album.popularity,
-                is_primary_artist_album: true,
-                metadata: { spotify: album }
-              })
-              .select("id")
-              .single();
-            
-            if (albumError) {
-              console.error(`Error storing album ${album.id}:`, albumError);
-              continue;
-            }
-            
-            processedAlbumIds.push(newAlbum.id);
-            
-            await updateDataQualityScore(
-              "album",
-              newAlbum.id,
-              "spotify",
-              album.popularity ? album.popularity / 100 : 0.6,
-              album.total_tracks && album.release_date ? 0.8 : 0.6,
-              0.9
-            );
-            
-            // Break early in test mode after 3 albums
-            if (isTestMode && processedAlbumIds.length >= 3) {
-              console.log('Test mode: Reached limit of 3 albums');
-              hasMore = false;
-              break;
-            }
-          }
-          
-          if (!hasMore || isTestMode) break;
-          offset += limit;
-          hasMore = albumsResult.next !== null;
-        }
-      } catch (albumsError) {
-        console.error(`Error fetching albums for ${artist.name}:`, albumsError);
-        
-        // If we have some albums already, continue with those
-        if (processedAlbumIds.length === 0) {
-          throw albumsError;
-        }
-        
-        await logSystemEvent(
-          "warning",
-          "process_artist",
-          `Error fetching albums but continuing with ${processedAlbumIds.length} existing albums`,
-          { 
-            artistId: artist.id, 
-            error: albumsError.message,
-            albumCount: processedAlbumIds.length
-          }
+    // Get new albums from Spotify without artificial limits
+    try {
+      let offset = 0;
+      let hasMore = true;
+      const limit = 50; // Maximum allowed by Spotify API
+      
+      while (hasMore) {
+        const albumsResult = await spotify.getArtistAlbums(
+          artist.spotify_id,
+          limit,
+          offset,
+          "album,single,ep"
         );
+        
+        if (!albumsResult?.items?.length) break;
+        
+        // Filter for primary artist albums
+        const albums = albumsResult.items.filter(album => 
+          album.artists[0].id === artist.spotify_id
+        );
+        
+        console.log(`Processing ${albums.length} albums for ${artist.name} (offset: ${offset})`);
+        
+        for (const album of albums) {
+          // Check if we already have this album
+          const { data: existingAlbum } = await supabase
+            .from("albums")
+            .select("id")
+            .eq("spotify_id", album.id)
+            .maybeSingle();
+          
+          if (existingAlbum) {
+            processedAlbumIds.push(existingAlbum.id);
+            continue;
+          }
+          
+          // Store new album
+          const { data: newAlbum, error: albumError } = await supabase
+            .from("albums")
+            .insert({
+              spotify_id: album.id,
+              name: album.name,
+              artist_id: artist.id,
+              album_type: album.album_type,
+              release_date: album.release_date,
+              total_tracks: album.total_tracks,
+              spotify_url: album.external_urls?.spotify,
+              image_url: album.images?.[0]?.url,
+              popularity: album.popularity,
+              is_primary_artist_album: true,
+              metadata: { spotify: album }
+            })
+            .select("id")
+            .single();
+          
+          if (albumError) {
+            console.error(`Error storing album ${album.id}:`, albumError);
+            continue;
+          }
+          
+          processedAlbumIds.push(newAlbum.id);
+          
+          await updateDataQualityScore(
+            "album",
+            newAlbum.id,
+            "spotify",
+            album.popularity ? album.popularity / 100 : 0.6,
+            album.total_tracks && album.release_date ? 0.8 : 0.6,
+            0.9
+          );
+        }
+        
+        offset += limit;
+        hasMore = albumsResult.next !== null;
       }
+    } catch (albumsError) {
+      console.error(`Error fetching albums for ${artist.name}:`, albumsError);
+      
+      // If we have some albums already, continue with those
+      if (processedAlbumIds.length === 0) {
+        throw albumsError;
+      }
+      
+      await logSystemEvent(
+        "warning",
+        "process_artist",
+        `Error fetching albums but continuing with ${processedAlbumIds.length} existing albums`,
+        { 
+          artistId: artist.id, 
+          error: albumsError.message,
+          albumCount: processedAlbumIds.length
+        }
+      );
     }
     
-    // Limit albums for test mode
-    if (isTestMode) {
-      processedAlbumIds = processedAlbumIds.slice(0, 3);
-    }
-    
-    // Create tracks processing batch
+    // Create tracks processing batch with all discovered albums
     const { data: batch, error: batchError } = await supabase
       .from("processing_batches")
       .insert({
@@ -233,19 +216,27 @@ async function processArtist(artistIdentifier: string, isTestMode = false): Prom
     if (batchError) throw batchError;
     
     if (processedAlbumIds.length > 0) {
-      const processingItems = processedAlbumIds.map(albumId => ({
-        batch_id: batch.id,
-        item_type: 'album_for_tracks',
-        item_id: albumId,
-        status: 'pending',
-        priority: 5
-      }));
-      
-      const { error: itemsError } = await supabase
-        .from("processing_items")
-        .insert(processingItems);
-      
-      if (itemsError) throw itemsError;
+      // Create processing items in chunks of 100
+      const chunkSize = 100;
+      for (let i = 0; i < processedAlbumIds.length; i += chunkSize) {
+        const chunk = processedAlbumIds.slice(i, i + chunkSize);
+        const processingItems = chunk.map(albumId => ({
+          batch_id: batch.id,
+          item_type: 'album_for_tracks',
+          item_id: albumId,
+          status: 'pending',
+          priority: 5
+        }));
+        
+        const { error: itemsError } = await supabase
+          .from("processing_items")
+          .insert(processingItems);
+        
+        if (itemsError) {
+          console.error(`Error adding batch chunk ${i / chunkSize + 1}:`, itemsError);
+          continue;
+        }
+      }
       
       console.log(`Added ${processedAlbumIds.length} albums to batch ${batch.id}`);
     }

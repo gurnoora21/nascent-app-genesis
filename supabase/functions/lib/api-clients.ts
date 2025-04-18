@@ -1,4 +1,3 @@
-
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
 const SUPABASE_URL = "https://nsxxzhhbcwzatvlulfyp.supabase.co";
@@ -50,18 +49,13 @@ export class ApiRateLimiter {
   // Check if endpoint is rate limited
   async isRateLimited(): Promise<{limited: boolean, retryAfter?: number}> {
     try {
-      const { data, error } = await supabase
+      const { data } = await supabase
         .from("api_rate_limits")
         .select("*")
         .eq("api_name", this.apiName)
         .eq("endpoint", this.endpoint)
-        .single();
-
-      if (error) {
-        console.error("Error checking rate limit:", error);
-        return { limited: false };
-      }
-
+        .maybeSingle();
+      
       if (!data) return { limited: false };
 
       // If reset time is in the future and no requests remaining
@@ -71,20 +65,19 @@ export class ApiRateLimiter {
         data.requests_remaining <= 0 &&
         new Date(data.reset_at) > new Date()
       ) {
-        // Calculate seconds remaining until reset
-        const secondsUntilReset = Math.ceil((new Date(data.reset_at).getTime() - Date.now()) / 1000);
-        return { limited: true, retryAfter: secondsUntilReset };
-      }
-
-      // If reset time is in the past, we can reset the counter
-      if (data.reset_at && new Date(data.reset_at) <= new Date()) {
-        await this.resetRateLimit();
-        return { limited: false };
+        // Calculate seconds until reset
+        const secondsUntilReset = Math.ceil(
+          (new Date(data.reset_at).getTime() - Date.now()) / 1000
+        );
+        return { 
+          limited: true, 
+          retryAfter: Math.min(secondsUntilReset, 30) // Cap at 30 seconds
+        };
       }
 
       return { limited: false };
     } catch (err) {
-      console.error("Error in isRateLimited:", err);
+      console.error("Error checking rate limits:", err);
       return { limited: false };
     }
   }
@@ -204,19 +197,12 @@ export class RetryHelper {
           throw error;
         }
         
-        // Check for retry-after in headers if it's a response error
-        let retryAfter = 0;
-        if (error.headers && error.headers.get) {
-          const retryAfterHeader = error.headers.get('retry-after');
-          if (retryAfterHeader) {
-            retryAfter = parseInt(retryAfterHeader) * 1000;
-          }
-        }
+        // Calculate backoff with maximum cap
+        const baseDelay = Math.min(initialDelay * Math.pow(2, attempt - 1), 30000);
+        const jitter = baseDelay * 0.1 * (Math.random() * 2 - 1); // 10% jitter
+        const delay = Math.min(baseDelay + jitter, 30000); // Ensure total delay never exceeds 30s
         
-        // Use retry-after from header or exponential backoff with jitter
-        const delay = retryAfter || initialDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random() * 0.5);
-        
-        console.warn(`${operationName} attempt ${attempt} failed, retrying in ${delay}ms...`);
+        console.warn(`${operationName} attempt ${attempt} failed, retrying in ${Math.round(delay)}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
