@@ -1,4 +1,3 @@
-
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { supabase } from "../lib/api-clients.ts";
 import { 
@@ -11,13 +10,11 @@ import {
   logSystemEvent
 } from "../lib/pipeline-utils.ts";
 
-// CORS headers for browser access
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-// Process a pending producers batch
 async function processProducersBatch(): Promise<{
   success: boolean;
   message: string;
@@ -27,12 +24,10 @@ async function processProducersBatch(): Promise<{
   status?: string;
 }> {
   try {
-    // Generate a unique worker ID
     const workerId = crypto.randomUUID();
     
     console.log(`Worker ${workerId} claiming a producers batch`);
     
-    // Pre-flight check: Check if APIs are rate limited
     const geniusLimited = await isApiRateLimited("genius", "/songs");
     const discogsLimited = await isApiRateLimited("discogs", "/releases");
     
@@ -44,8 +39,7 @@ async function processProducersBatch(): Promise<{
       };
     }
     
-    // Claim a batch to process with soft locking mechanism
-    const batchId = await claimProcessingBatch("process_producers", workerId, 3600); // 1 hour claim time
+    const batchId = await claimProcessingBatch("process_producers", workerId, 3600);
     
     if (!batchId) {
       return {
@@ -57,15 +51,12 @@ async function processProducersBatch(): Promise<{
     
     console.log(`Worker ${workerId} claimed producers batch ${batchId}`);
     
-    // Validate batch integrity
     const batchValidation = await validateBatchIntegrity(batchId);
     if (!batchValidation.valid) {
       console.warn(`Batch integrity check failed: ${batchValidation.reason}`);
       
-      // Release the batch as it's not valid
       await releaseProcessingBatch(batchId, workerId, "error");
       
-      // Update batch with error message
       await supabase
         .from("processing_batches")
         .update({
@@ -81,10 +72,8 @@ async function processProducersBatch(): Promise<{
       };
     }
     
-    // Define batch-specific parameters
-    const batchSize = 10; // Default conservative batch size
+    const batchSize = 10;
     
-    // Get items to process - these are tracks for which we need to identify producers
     const { data: items, error: itemsError } = await supabase
       .from("processing_items")
       .select("*")
@@ -100,7 +89,6 @@ async function processProducersBatch(): Promise<{
     }
     
     if (!items || items.length === 0) {
-      // No items to process, release the batch as completed
       await releaseProcessingBatch(batchId, workerId, "completed");
       
       return {
@@ -123,12 +111,10 @@ async function processProducersBatch(): Promise<{
     const processedItems: string[] = [];
     const failedItems: string[] = [];
     
-    // Process producer identification
     await identifyProducers(items, processedItems, failedItems);
     
     console.log(`Producers batch ${batchId} processing complete. Processed: ${processedItems.length}, Failed: ${failedItems.length}`);
     
-    // Get accurate counts from the database for this batch
     const { count: totalItems, error: countError } = await supabase
       .from("processing_items")
       .select("*", { count: "exact", head: true })
@@ -152,17 +138,14 @@ async function processProducersBatch(): Promise<{
       .eq("batch_id", batchId)
       .eq("status", "error");
     
-    // Calculate if all items are processed
     const allDone = !pendingError && pendingItems === 0;
     
-    // Release the batch with appropriate status
     await releaseProcessingBatch(
       batchId,
       workerId,
       allDone ? "completed" : "processing"
     );
     
-    // Update batch with accurate progress
     if (!countError && !completedError && !errorCountError) {
       await supabase
         .from("processing_batches")
@@ -185,13 +168,12 @@ async function processProducersBatch(): Promise<{
   } catch (error) {
     console.error("Error processing producers batch:", error);
     
-    // Log error using our utility function
     await logSystemEvent(
       "error",
       "process_producers_batch",
       `Error processing producers batch: ${error.message}`,
       { error: error.stack || error.message },
-      crypto.randomUUID() // Generate a trace ID
+      crypto.randomUUID()
     );
     
     return {
@@ -202,13 +184,11 @@ async function processProducersBatch(): Promise<{
   }
 }
 
-// Identify producers for tracks
 async function identifyProducers(
   items: any[], 
   processedItems: string[], 
   failedItems: string[]
 ): Promise<void> {
-  // Process each track - identify producers for each track
   for (const item of items) {
     try {
       if (item.item_type !== "track") {
@@ -218,7 +198,6 @@ async function identifyProducers(
       const trackId = item.item_id;
       console.log(`Identifying producers for track ${trackId}`);
       
-      // Call the identify-producers function
       const response = await fetch(
         `https://nsxxzhhbcwzatvlulfyp.supabase.co/functions/v1/identify-producers`,
         {
@@ -241,7 +220,6 @@ async function identifyProducers(
         throw new Error(result.message || "Unknown error identifying producers");
       }
       
-      // Mark item as processed using the utility function
       await updateItemStatus(
         item.id,
         "completed",
@@ -258,14 +236,12 @@ async function identifyProducers(
     } catch (error) {
       console.error(`Error identifying producers for track ${item.item_id}:`, error);
       
-      // Determine if error is transient or permanent
       const isTransient = error.message.includes("rate limit") || 
                           error.message.includes("timeout") ||
                           error.message.includes("network");
       
       const shouldRetry = (item.retry_count || 0) < 5 && isTransient;
       
-      // Update item status using utility function
       await updateItemStatus(
         item.id,
         shouldRetry ? "pending" : "error",
@@ -278,12 +254,10 @@ async function identifyProducers(
         error.message
       );
       
-      // Only count as failed if we've given up retrying
       if (!shouldRetry) {
         failedItems.push(item.id);
       }
       
-      // Log specific error
       await logSystemEvent(
         "error",
         "process_producers_batch",
@@ -295,13 +269,11 @@ async function identifyProducers(
 }
 
 serve(async (req) => {
-  // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    // Allow for manual processing through payload
     if (req.method === "POST") {
       const payload = await req.json();
       
@@ -335,7 +307,6 @@ serve(async (req) => {
       );
     }
     
-    // Default behavior: process a batch
     const result = await processProducersBatch();
     
     return new Response(
@@ -351,13 +322,12 @@ serve(async (req) => {
   } catch (error) {
     console.error("Error handling process-producers-batch request:", error);
     
-    // Log error using the utility function
     await logSystemEvent(
       "error",
       "process_producers_batch",
       `Error handling process-producers-batch request: ${error.message}`,
       { error: error.stack || error.message },
-      crypto.randomUUID() // Generate a trace ID
+      crypto.randomUUID()
     );
 
     return new Response(

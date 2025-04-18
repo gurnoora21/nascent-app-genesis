@@ -1,12 +1,18 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
-import { Database } from "../../../src/integrations/supabase/types.ts";
+import { 
+  ProcessingItem, 
+  WorkerHeartbeat, 
+  RateLimit, 
+  DataQualityScore, 
+  SystemLogEntry 
+} from "./types.ts";
 
 const SUPABASE_URL = "https://nsxxzhhbcwzatvlulfyp.supabase.co";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
 
 // Initialize Supabase client with service role for admin access to DB
-const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 // Batch Management Utils
 export async function claimProcessingBatch(
@@ -277,6 +283,46 @@ export async function logSystemEvent(
       });
   } catch (error) {
     console.error('Error logging system event:', error);
+  }
+}
+
+// Add function for validating batch integrity
+export async function validateBatchIntegrity(batchId: string): Promise<{ valid: boolean; reason?: string }> {
+  try {
+    // Check if batch exists
+    const { data: batch, error: batchError } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .eq("id", batchId)
+      .single();
+    
+    if (batchError || !batch) {
+      return { valid: false, reason: `Batch ${batchId} not found or error retrieving it: ${batchError?.message}` };
+    }
+    
+    // Check batch status
+    if (batch.status !== 'pending' && batch.status !== 'processing') {
+      return { valid: false, reason: `Batch status is ${batch.status}, not pending or processing` };
+    }
+    
+    // Check item count
+    const { count, error: countError } = await supabase
+      .from("processing_items")
+      .select("*", { count: "exact", head: true })
+      .eq("batch_id", batchId);
+    
+    if (countError) {
+      return { valid: false, reason: `Error checking item count: ${countError.message}` };
+    }
+    
+    if (count === 0) {
+      return { valid: false, reason: `Batch has no items to process` };
+    }
+    
+    return { valid: true };
+  } catch (error) {
+    console.error('Error validating batch integrity:', error);
+    return { valid: false, reason: `Exception during validation: ${error.message}` };
   }
 }
 
