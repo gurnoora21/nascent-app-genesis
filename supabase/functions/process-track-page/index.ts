@@ -11,7 +11,6 @@ import {
 } from "../lib/pipeline-utils.ts";
 import { supabase, spotify } from "../lib/api-clients.ts";
 
-// CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
@@ -39,12 +38,8 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
   const { batchId, correlationId } = request;
   const processedTracks: string[] = [];
   const failedTracks: string[] = [];
-  
-  // Generate a correlation ID if one wasn't provided
-  const traceId = correlationId || crypto.randomUUID();
-  
-  // Start tracking metrics
   const startTime = Date.now();
+  const traceId = correlationId || crypto.randomUUID();
   
   try {
     // Log start of processing
@@ -98,8 +93,8 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
     if (albumError || !album) {
       throw new Error(`Album ${albumId} not found: ${albumError?.message || 'No data returned'}`);
     }
-    
-    // Get artist details
+
+    // Get artist details and fetch tracks from Spotify
     const { data: artist, error: artistError } = await supabase
       .from('artists')
       .select('id, name')
@@ -136,25 +131,35 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
     }
     
     if (!tracks || tracks.length === 0) {
-      await logSystemEvent('info', 'process_track_page', 
-        `No tracks found for album ${album.name} at offset ${offset}`, 
-        { albumId, albumName: album.name, offset, limit, traceId },
-        traceId
-      );
-      
-      // Update batch as completed since there's nothing to process
+      const finalStatus = {
+        status: 'completed',
+        items_total: 0,
+        items_processed: 0,
+        items_failed: 0,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        metadata: {
+          ...batch.metadata,
+          is_final_page: true,
+          processing_time_ms: Date.now() - startTime,
+          success_rate: 1,
+          offset,
+          limit
+        }
+      };
+
       await supabase
         .from('processing_batches')
-        .update({
-          status: 'completed',
-          items_total: 0,
-          items_processed: 0,
-          items_failed: 0,
-          completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
-        })
+        .update(finalStatus)
         .eq('id', batchId);
-      
+
+      // Since this is the final page (no tracks found), update parent album batch
+      if (parentAlbumBatchId) {
+        edgeRuntime.waitUntil(
+          updateParentAlbumBatch(parentAlbumBatchId, albumId, traceId)
+        );
+      }
+
       return {
         success: true,
         message: `No tracks found for album ${album.name} at offset ${offset}`,
@@ -165,22 +170,7 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       };
     }
     
-    // Process each track
-    await logSystemEvent('info', 'process_track_page', 
-      `Processing ${tracks.length} tracks for album ${album.name}`, 
-      { albumId, albumName: album.name, trackCount: tracks.length, traceId },
-      traceId
-    );
-    
-    // Update batch with total item count
-    await supabase
-      .from('processing_batches')
-      .update({
-        items_total: tracks.length
-      })
-      .eq('id', batchId);
-    
-    // Process tracks in smaller batches to avoid DB connection issues
+    // Process tracks in smaller batches
     const batchSize = 10;
     const trackBatches = [];
     
@@ -207,97 +197,83 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       await sleep(200);
     }
     
-    // Calculate processing time and success rate
-    const processingTimeMs = Date.now() - startTime;
+    // Calculate if this was the final page and success metrics
+    const isFinal = tracks.length < limit;
     const successRate = processedTracks.length / tracks.length;
     
-    // Check if we need to schedule the next page
-    const needsNextPage = tracks && tracks.length === limit;
+    // Update batch status with pagination metadata
+    const batchStatus = {
+      status: isFinal ? 'completed' : 'completed_with_next',
+      metadata: {
+        ...batch.metadata,
+        offset,
+        limit,
+        is_final_page: isFinal,
+        next_page_offset: isFinal ? null : offset + limit,
+        processing_time_ms: Date.now() - startTime,
+        success_rate: successRate,
+        album_id: albumId,
+        parent_album_batch_id: parentAlbumBatchId
+      },
+      items_total: tracks.length,
+      items_processed: processedTracks.length,
+      items_failed: failedTracks.length,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    await supabase
+      .from('processing_batches')
+      .update(batchStatus)
+      .eq('id', batchId);
+
+    // Schedule next page processing if not final
     let nextPageScheduled = false;
-    
-    if (needsNextPage) {
-      try {
-        // Create next page batch
-        const { data: nextBatch, error: nextBatchError } = await supabase
-          .from('processing_batches')
+    if (!isFinal) {
+      const nextOffset = offset + limit;
+      
+      edgeRuntime.waitUntil(
+        supabase.from('processing_batches')
           .insert({
             batch_type: 'process_track_page',
             status: 'pending',
             metadata: {
               album_id: albumId,
-              offset: offset + limit,
-              limit,
               parent_album_batch_id: parentAlbumBatchId,
+              offset: nextOffset,
+              limit,
               correlation_id: traceId,
               source: 'pagination'
             }
           })
-          .select('id')
-          .single();
-          
-        if (nextBatchError) {
-          await logSystemEvent('error', 'process_track_page',
-            `Failed to create next page batch: ${nextBatchError.message}`,
-            { albumId, offset: offset + limit, traceId },
-            traceId
-          );
-        } else {
-          nextPageScheduled = true;
-          await logSystemEvent('info', 'process_track_page',
-            `Scheduled next page batch ${nextBatch.id} for offset ${offset + limit}`,
-            { nextBatchId: nextBatch.id, albumId, offset: offset + limit, traceId },
-            traceId
-          );
-        }
-      } catch (error) {
-        await logSystemEvent('error', 'process_track_page',
-          `Error scheduling next page: ${error.message}`,
-          { albumId, offset: offset + limit, traceId },
-          traceId
-        );
-      }
+          .then(async ({ error: nextPageError }) => {
+            if (nextPageError) {
+              await logSystemEvent('error', 'process_track_page',
+                `Error scheduling next page: ${nextPageError.message}`,
+                { albumId, offset: nextOffset, traceId },
+                traceId
+              );
+            }
+          })
+      );
+      
+      nextPageScheduled = true;
     }
-    
-    // Calculate if this was the final page for the album
-    const isFinalPage = !needsNextPage;
-    
-    // Update batch status
-    const finalStatus = nextPageScheduled ? 'completed_with_next' : 'completed';
-    
-    await supabase
-      .from('processing_batches')
-      .update({
-        status: finalStatus,
-        items_total: tracks?.length || 0,
-        items_processed: processedTracks.length,
-        items_failed: failedTracks.length,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        metadata: {
-          ...batch.metadata,
-          processing_time_ms: Date.now() - startTime,
-          is_final_page: isFinalPage,
-          total_processed: processedTracks.length,
-          next_page_scheduled: nextPageScheduled
-        }
-      })
-      .eq('id', batchId);
-    
-    // If this was the final page, notify the album batch
-    if (isFinalPage && parentAlbumBatchId) {
-      // Asynchronously update the parent album batch
+
+    // If this was the final page, trigger parent album batch update
+    if (isFinal && parentAlbumBatchId) {
       edgeRuntime.waitUntil(
         updateParentAlbumBatch(parentAlbumBatchId, albumId, traceId)
       );
     }
-    
+
     return {
       success: true,
       message: `Processed ${processedTracks.length} tracks, failed ${failedTracks.length} tracks${nextPageScheduled ? ', scheduled next page' : ''}`,
       batchId,
       processed: processedTracks.length,
       failed: failedTracks.length,
-      status: finalStatus,
+      status: batchStatus.status,
       nextPageScheduled
     };
     
@@ -339,7 +315,6 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
   }
 }
 
-// Get tracks for an album from Spotify
 async function getAlbumTracks(
   spotifyId: string, 
   offset: number, 
@@ -386,7 +361,6 @@ async function getAlbumTracks(
   }
 }
 
-// Process a single track
 async function processTrack(
   spotifyTrack: any, 
   albumId: string,
@@ -557,7 +531,6 @@ async function processTrack(
   }
 }
 
-// Calculate track data quality score based on completeness
 function calculateTrackQualityScore(track: any): number {
   let score = 0.5; // Base score
   
@@ -574,7 +547,6 @@ function calculateTrackQualityScore(track: any): number {
   return Math.min(score, 1.0);
 }
 
-// New function to update parent album batch status
 async function updateParentAlbumBatch(
   parentBatchId: string,
   albumId: string,
@@ -584,7 +556,7 @@ async function updateParentAlbumBatch(
     // Get all track page batches for this album
     const { data: trackBatches, error: batchError } = await supabase
       .from('processing_batches')
-      .select('id, status')
+      .select('id, status, metadata')
       .eq('batch_type', 'process_track_page')
       .eq('metadata->parent_album_batch_id', parentBatchId)
       .eq('metadata->album_id', albumId);
@@ -592,13 +564,17 @@ async function updateParentAlbumBatch(
     if (batchError) {
       throw new Error(`Error checking track batches: ${batchError.message}`);
     }
-    
-    // Check if all track pages are completed
+
+    // Check if all track pages are completed and find the final page
     const allCompleted = trackBatches?.every(batch => 
       batch.status === 'completed' || batch.status === 'completed_with_next'
     );
-    
-    if (allCompleted) {
+
+    const hasFinalPage = trackBatches?.some(batch => 
+      batch.metadata?.is_final_page === true
+    );
+
+    if (allCompleted && hasFinalPage) {
       await logSystemEvent('info', 'process_track_page',
         `All track pages completed for album ${albumId}`,
         { parentBatchId, albumId, traceId },
