@@ -275,10 +275,17 @@ export async function getBatchHierarchy(batchId: string): Promise<{
       };
     }
     
-    // Check if this batch has a parent
-    const parentBatchId = batch.metadata && typeof batch.metadata === 'object' && 'parent_batch_id' in batch.metadata 
-      ? batch.metadata.parent_batch_id 
-      : null;
+    // Check if this batch has a parent - ensure we're dealing with an object and the property exists
+    let parentBatchId: string | null = null;
+    
+    if (batch.metadata && 
+        typeof batch.metadata === 'object' && 
+        batch.metadata !== null && 
+        !Array.isArray(batch.metadata) && 
+        'parent_batch_id' in batch.metadata && 
+        typeof batch.metadata.parent_batch_id === 'string') {
+      parentBatchId = batch.metadata.parent_batch_id;
+    }
     
     let parentBatch = null;
     
@@ -292,7 +299,7 @@ export async function getBatchHierarchy(batchId: string): Promise<{
       parentBatch = parent;
     }
     
-    // Check for child batches
+    // Check for child batches - make sure we filter with a string value
     const { data: childBatches } = await supabase
       .from("processing_batches")
       .select("*")
