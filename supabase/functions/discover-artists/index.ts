@@ -12,6 +12,15 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
+// Define target markets
+const TARGET_MARKETS = [
+  // North America
+  'US', 'CA',
+  // Europe
+  'GB', 'DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'SE', 'NO', 'DK', 
+  'FI', 'IE', 'PT', 'AT', 'CH', 'PL', 'CZ', 'HU', 'SK', 'GR'
+];
+
 interface DiscoverArtistsOptions {
   genres?: string[];
   limit?: number;
@@ -114,8 +123,12 @@ async function discoverArtistsInGenre(
   try {
     await logSystemEvent("info", "discover_artists", `Discovering artists in genre: ${genre}`, { genre, maxArtists });
     
-    // Search for artists in the genre
-    const searchResult = await spotify.searchArtists(`genre:${genre}`, 50);
+    // Update search to include market parameter
+    const searchResult = await spotify.searchArtists(
+      `genre:${genre}`, 
+      50, 
+      { market: TARGET_MARKETS.join(',') }
+    );
     
     if (!searchResult?.artists?.items || searchResult.artists.items.length === 0) {
       await logSystemEvent("info", "discover_artists", `No artists found for genre: ${genre}`, { genre });
@@ -124,11 +137,23 @@ async function discoverArtistsInGenre(
 
     // Filter and sort artists by popularity
     const artists = searchResult.artists.items
-      .filter((artist: any) => artist.popularity >= minPopularity)
+      .filter((artist: any) => {
+        // Check if artist has presence in target markets
+        const hasTargetMarket = artist.markets ? 
+          artist.markets.some((market: string) => TARGET_MARKETS.includes(market)) :
+          true; // If no market data, assume they're available
+        
+        return hasTargetMarket && artist.popularity >= minPopularity;
+      })
       .sort((a: any, b: any) => b.popularity - a.popularity)
       .slice(0, maxArtists);
 
-    await logSystemEvent("info", "discover_artists", `Found ${artists.length} artists for genre: ${genre}`, { genre, artistCount: artists.length });
+    await logSystemEvent(
+      "info", 
+      "discover_artists", 
+      `Found ${artists.length} artists for genre: ${genre} in target markets`,
+      { genre, artistCount: artists.length, markets: TARGET_MARKETS }
+    );
 
     // Process each artist
     for (let i = 0; i < artists.length; i++) {
