@@ -135,19 +135,22 @@ export async function getBatchStatus(batchId: string): Promise<{
     // Determine the current pipeline stage based on metadata flags
     let currentStage = "initializing";
     
-    if (batch.metadata?.pipeline_completed) {
+    // Type check to ensure the metadata is an object
+    const metadata = typeof batch.metadata === 'object' && batch.metadata !== null ? batch.metadata : {};
+    
+    if (metadata && 'pipeline_completed' in metadata && !!metadata.pipeline_completed) {
       currentStage = "completed";
-    } else if (batch.metadata?.producers_dispatched) {
+    } else if (metadata && 'producers_dispatched' in metadata && !!metadata.producers_dispatched) {
       currentStage = "processing_producers";
-    } else if (batch.metadata?.tracks_completed) {
+    } else if (metadata && 'tracks_completed' in metadata && !!metadata.tracks_completed) {
       currentStage = "tracks_completed";
-    } else if (batch.metadata?.tracks_dispatched) {
+    } else if (metadata && 'tracks_dispatched' in metadata && !!metadata.tracks_dispatched) {
       currentStage = "processing_tracks";
-    } else if (batch.metadata?.albums_completed) {
+    } else if (metadata && 'albums_completed' in metadata && !!metadata.albums_completed) {
       currentStage = "albums_completed";
-    } else if (batch.metadata?.albums_dispatched) {
+    } else if (metadata && 'albums_dispatched' in metadata && !!metadata.albums_dispatched) {
       currentStage = "processing_albums";
-    } else if (batch.metadata?.artists_completed) {
+    } else if (metadata && 'artists_completed' in metadata && !!metadata.artists_completed) {
       currentStage = "artists_completed";
     } else if (batch.status === 'processing') {
       currentStage = `processing_${batch.batch_type}`;
