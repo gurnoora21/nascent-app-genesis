@@ -251,3 +251,356 @@ export async function requeueDeadLetterItem(deadLetterId: string): Promise<{
     };
   }
 }
+
+// NEW FUNCTIONS - Added for enhanced monitoring and batch hierarchy
+
+// Get a full hierarchy of batches (parent batch + all child batches)
+export async function getBatchHierarchy(batchId: string): Promise<{
+  success: boolean;
+  hierarchy?: any;
+  message?: string;
+}> {
+  try {
+    // First get the batch itself
+    const { data: batch, error: batchError } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .eq("id", batchId)
+      .single();
+    
+    if (batchError || !batch) {
+      return {
+        success: false,
+        message: `Error retrieving batch: ${batchError?.message || "Batch not found"}`
+      };
+    }
+    
+    // Check if this batch has a parent
+    const parentBatchId = batch.metadata?.parent_batch_id;
+    let parentBatch = null;
+    
+    if (parentBatchId) {
+      const { data: parent } = await supabase
+        .from("processing_batches")
+        .select("*")
+        .eq("id", parentBatchId)
+        .single();
+      
+      parentBatch = parent;
+    }
+    
+    // Check for child batches
+    const { data: childBatches } = await supabase
+      .from("processing_batches")
+      .select("*")
+      .filter("metadata->parent_batch_id", "eq", batchId);
+    
+    // Add children to result
+    const hierarchy = {
+      ...batch,
+      parent: parentBatch,
+      children: childBatches || []
+    };
+    
+    return {
+      success: true,
+      hierarchy
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Get metrics for the processing pipeline
+export async function getPipelineMetrics(
+  timeWindowHours = 24,
+  batchType?: string
+): Promise<{
+  success: boolean;
+  metrics?: {
+    processedItems: number;
+    failedItems: number;
+    avgProcessingTimeMs: number;
+    dlqItems: number;
+    errorRates: {
+      [key: string]: number;
+    };
+  };
+  message?: string;
+}> {
+  try {
+    const startTime = new Date();
+    startTime.setHours(startTime.getHours() - timeWindowHours);
+    
+    // Build query for batches
+    let batchQuery = supabase
+      .from("processing_batches")
+      .select("batch_type, items_processed, items_failed, started_at, completed_at")
+      .gte("updated_at", startTime.toISOString());
+    
+    if (batchType) {
+      batchQuery = batchQuery.eq("batch_type", batchType);
+    }
+    
+    // Get batch data
+    const { data: batches, error: batchError } = await batchQuery;
+    
+    if (batchError) {
+      return {
+        success: false,
+        message: `Error retrieving batch metrics: ${batchError.message}`
+      };
+    }
+    
+    // Calculate metrics
+    let processedItems = 0;
+    let failedItems = 0;
+    let totalProcessingTimeMs = 0;
+    let completedBatchCount = 0;
+    const errorRates: {[key: string]: {count: number, total: number}} = {};
+    
+    batches?.forEach(batch => {
+      // Skip batches that haven't completed yet
+      if (!batch.completed_at) return;
+      
+      processedItems += batch.items_processed || 0;
+      failedItems += batch.items_failed || 0;
+      
+      // Track batch type error rates
+      if (!errorRates[batch.batch_type]) {
+        errorRates[batch.batch_type] = {count: 0, total: 0};
+      }
+      
+      const batchTotal = (batch.items_processed || 0) + (batch.items_failed || 0);
+      errorRates[batch.batch_type].count += batch.items_failed || 0;
+      errorRates[batch.batch_type].total += batchTotal;
+      
+      // Calculate processing time if we have both timestamps
+      if (batch.started_at && batch.completed_at) {
+        const startTime = new Date(batch.started_at).getTime();
+        const endTime = new Date(batch.completed_at).getTime();
+        
+        if (endTime > startTime) {
+          totalProcessingTimeMs += (endTime - startTime);
+          completedBatchCount++;
+        }
+      }
+    });
+    
+    // Get DLQ count
+    const { count: dlqItems, error: dlqError } = await supabase
+      .from("dead_letter_items")
+      .select("*", { count: "exact", head: true })
+      .gte("created_at", startTime.toISOString());
+    
+    if (dlqError) {
+      return {
+        success: false,
+        message: `Error retrieving DLQ metrics: ${dlqError.message}`
+      };
+    }
+    
+    // Calculate averages and format error rates
+    const avgProcessingTimeMs = completedBatchCount > 0 
+      ? Math.round(totalProcessingTimeMs / completedBatchCount) 
+      : 0;
+    
+    const formattedErrorRates: {[key: string]: number} = {};
+    Object.keys(errorRates).forEach(key => {
+      const { count, total } = errorRates[key];
+      formattedErrorRates[key] = total > 0 ? count / total : 0;
+    });
+    
+    return {
+      success: true,
+      metrics: {
+        processedItems,
+        failedItems,
+        avgProcessingTimeMs,
+        dlqItems: dlqItems || 0,
+        errorRates: formattedErrorRates
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Monitor batch progress with enhanced metrics for paginated batches
+export async function monitorBatchProgress(batchId: string): Promise<{
+  success: boolean;
+  status?: string;
+  progress?: {
+    total: number;
+    processed: number;
+    failed: number;
+    percentComplete: number;
+    pagesTotal?: number;
+    pagesCompleted?: number;
+    estimatedTimeRemaining?: number;
+  };
+  message?: string;
+}> {
+  try {
+    // Get batch hierarchy to check for child batches
+    const { success: hierarchySuccess, hierarchy } = await getBatchHierarchy(batchId);
+    
+    if (!hierarchySuccess || !hierarchy) {
+      return {
+        success: false,
+        message: `Error retrieving batch hierarchy for ${batchId}`
+      };
+    }
+    
+    // Basic progress metrics from the batch itself
+    const total = hierarchy.items_total || 0;
+    const processed = hierarchy.items_processed || 0;
+    const failed = hierarchy.items_failed || 0;
+    let percentComplete = total > 0 ? Math.round((processed / total) * 100) : 0;
+    
+    // Enhanced metrics for paginated batches
+    let pagesTotal = 0;
+    let pagesCompleted = 0;
+    let estimatedTimeRemaining = 0;
+    
+    // If this batch has children, it's a paginated batch
+    if (hierarchy.children && hierarchy.children.length > 0) {
+      pagesTotal = hierarchy.children.length;
+      pagesCompleted = hierarchy.children.filter((b: any) => 
+        b.status === 'completed' || b.status === 'error'
+      ).length;
+      
+      // If some pages are complete, we can estimate time remaining
+      if (pagesCompleted > 0 && pagesTotal > pagesCompleted) {
+        // Find the average time per page for completed pages
+        const completedPages = hierarchy.children.filter((b: any) => 
+          b.status === 'completed' && b.started_at && b.completed_at
+        );
+        
+        if (completedPages.length > 0) {
+          let totalProcessingTimeMs = 0;
+          
+          completedPages.forEach((page: any) => {
+            const startTime = new Date(page.started_at).getTime();
+            const endTime = new Date(page.completed_at).getTime();
+            
+            if (endTime > startTime) {
+              totalProcessingTimeMs += (endTime - startTime);
+            }
+          });
+          
+          const avgTimePerPageMs = totalProcessingTimeMs / completedPages.length;
+          const remainingPages = pagesTotal - pagesCompleted;
+          
+          // Estimate time remaining in seconds
+          estimatedTimeRemaining = Math.round((avgTimePerPageMs * remainingPages) / 1000);
+        }
+      }
+      
+      // Override percentComplete with page-based calculation for more accuracy
+      percentComplete = pagesTotal > 0 ? Math.round((pagesCompleted / pagesTotal) * 100) : 0;
+    }
+    
+    return {
+      success: true,
+      status: hierarchy.status,
+      progress: {
+        total,
+        processed,
+        failed,
+        percentComplete,
+        pagesTotal: pagesTotal > 0 ? pagesTotal : undefined,
+        pagesCompleted: pagesCompleted > 0 ? pagesCompleted : undefined,
+        estimatedTimeRemaining: estimatedTimeRemaining > 0 ? estimatedTimeRemaining : undefined
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Get alerts for the pipeline - errors, rate limits, circuit breakers
+export async function getPipelineAlerts(
+  timeWindowHours = 24,
+  limit = 10
+): Promise<{
+  success: boolean;
+  alerts?: Array<{
+    type: 'error' | 'rate_limit' | 'circuit_breaker' | 'backpressure';
+    message: string;
+    component: string;
+    timestamp: string;
+    context?: any;
+  }>;
+  count?: number;
+  message?: string;
+}> {
+  try {
+    const startTime = new Date();
+    startTime.setHours(startTime.getHours() - timeWindowHours);
+    
+    // Get system log alerts
+    const { data: logAlerts, error: logError, count } = await supabase
+      .from("system_logs")
+      .select("*", { count: "exact" })
+      .in("log_level", ["warning", "error"])
+      .in("component", [
+        "circuit_breaker", 
+        "backpressure", 
+        "error_rate_alert", 
+        "batch_completion"
+      ])
+      .gte("created_at", startTime.toISOString())
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    
+    if (logError) {
+      return {
+        success: false,
+        message: `Error retrieving pipeline alerts: ${logError.message}`
+      };
+    }
+    
+    // Format alerts
+    const alerts = logAlerts?.map(log => {
+      // Determine alert type
+      let type: 'error' | 'rate_limit' | 'circuit_breaker' | 'backpressure' = 'error';
+      
+      if (log.component === 'circuit_breaker') {
+        type = 'circuit_breaker';
+      } else if (log.component === 'backpressure') {
+        type = 'backpressure';
+      } else if (log.message.includes('rate limit')) {
+        type = 'rate_limit';
+      }
+      
+      return {
+        type,
+        message: log.message,
+        component: log.component,
+        timestamp: log.created_at,
+        context: log.context
+      };
+    });
+    
+    return {
+      success: true,
+      alerts: alerts || [],
+      count: count || 0
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}

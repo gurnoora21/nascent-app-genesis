@@ -436,7 +436,14 @@ export const config = {
   BATCH_CLAIM_TTL_SECONDS: Number(Deno.env.get("BATCH_CLAIM_TTL_SECONDS") || 3600),
   
   // Worker settings
-  WORKER_HEARTBEAT_INTERVAL_MS: Number(Deno.env.get("WORKER_HEARTBEAT_INTERVAL_MS") || 30000)
+  WORKER_HEARTBEAT_INTERVAL_MS: Number(Deno.env.get("WORKER_HEARTBEAT_INTERVAL_MS") || 30000),
+  
+  // NEW SETTINGS - Added for paginated worker queue
+  PAGE_SIZE_ALBUMS: Number(Deno.env.get("PAGE_SIZE_ALBUMS") || 20),
+  PAGE_SIZE_TRACKS: Number(Deno.env.get("PAGE_SIZE_TRACKS") || 50),
+  MAX_WORKERS_PER_TYPE: Number(Deno.env.get("MAX_WORKERS_PER_TYPE") || 5),
+  CIRCUIT_BREAKER_THRESHOLD: Number(Deno.env.get("CIRCUIT_BREAKER_THRESHOLD") || 5),
+  CIRCUIT_BREAKER_RESET_SECONDS: Number(Deno.env.get("CIRCUIT_BREAKER_RESET_SECONDS") || 300)
 };
 
 // Reset expired batches (for scheduled jobs)
@@ -453,5 +460,320 @@ export async function resetExpiredBatches(): Promise<number> {
   } catch (error) {
     console.error('Error calling reset_expired_batches:', error);
     return 0;
+  }
+}
+
+// NEW FUNCTIONS - Added for paginated worker queue system
+
+// Calculate backoff time with exponential delay and jitter
+export function calculateBackoffMs(
+  retryCount: number, 
+  baseDelayMs: number = config.BASE_THROTTLE_MS, 
+  maxDelayMs: number = config.MAX_THROTTLE_MS
+): number {
+  // Base exponential delay: baseDelay * 2^retryCount
+  const expDelay = baseDelayMs * Math.pow(2, retryCount);
+  
+  // Add random jitter (±25%)
+  const jitterRange = expDelay * 0.25;
+  const jitter = Math.random() * jitterRange * 2 - jitterRange;
+  
+  // Apply jitter and cap at max delay
+  return Math.min(expDelay + jitter, maxDelayMs);
+}
+
+// Create paginated batches for large jobs
+export async function createPaginatedBatches(
+  batchType: string,
+  parentBatchId: string | null,
+  totalItems: number,
+  itemsPerPage: number,
+  baseMetadata: Record<string, any> = {}
+): Promise<string[]> {
+  try {
+    const totalPages = Math.ceil(totalItems / itemsPerPage);
+    const batchIds: string[] = [];
+    
+    // Create a batch for each page
+    for (let pageIndex = 0; pageIndex < totalPages; pageIndex++) {
+      const offset = pageIndex * itemsPerPage;
+      
+      // Create metadata with pagination info
+      const metadata = {
+        ...baseMetadata,
+        parent_batch_id: parentBatchId,
+        page_index: pageIndex,
+        total_pages: totalPages,
+        offset: offset,
+        limit: itemsPerPage,
+        pagination: true,
+        created_at: new Date().toISOString()
+      };
+      
+      // Create the batch
+      const { data: newBatch, error } = await supabase
+        .from('processing_batches')
+        .insert({
+          batch_type: batchType,
+          status: 'pending',
+          metadata
+        })
+        .select('id')
+        .single();
+      
+      if (error || !newBatch) {
+        console.error(`Error creating paginated batch for page ${pageIndex}:`, error);
+        continue;
+      }
+      
+      batchIds.push(newBatch.id);
+      
+      // Track metrics
+      await incrementMetric('paginated_batches_created', 1, {
+        batch_type: batchType,
+        page_index: pageIndex,
+        total_pages: totalPages,
+        items_per_page: itemsPerPage
+      });
+    }
+    
+    return batchIds;
+  } catch (error) {
+    console.error('Error creating paginated batches:', error);
+    return [];
+  }
+}
+
+// Check if all child batches of a parent are complete
+export async function checkBatchCompletion(
+  parentBatchId: string
+): Promise<{ complete: boolean; total: number; completed: number; failed: number }> {
+  try {
+    // Find all child batches
+    const { data: childBatches, error } = await supabase
+      .from('processing_batches')
+      .select('id, status, items_total, items_processed, items_failed')
+      .filter('metadata->parent_batch_id', 'eq', parentBatchId);
+    
+    if (error || !childBatches || childBatches.length === 0) {
+      return { complete: false, total: 0, completed: 0, failed: 0 };
+    }
+    
+    const total = childBatches.length;
+    const completed = childBatches.filter(b => b.status === 'completed').length;
+    const failed = childBatches.filter(b => b.status === 'error').length;
+    
+    // Complete when all batches are either completed or error
+    const complete = (completed + failed) === total;
+    
+    // Log completion status
+    if (complete) {
+      await logSystemEvent('info', 'batch_completion', 
+        `Batch ${parentBatchId} - All child batches complete: ${completed} successful, ${failed} failed`,
+        { parentBatchId, total, completed, failed }
+      );
+      
+      // Update the parent batch with completion stats
+      await supabase
+        .from('processing_batches')
+        .update({
+          items_total: total,
+          items_processed: completed,
+          items_failed: failed,
+          status: failed === 0 ? 'completed' : (completed > 0 ? 'partial' : 'error'),
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', parentBatchId);
+    }
+    
+    return { complete, total, completed, failed };
+  } catch (error) {
+    console.error('Error checking batch completion:', error);
+    return { complete: false, total: 0, completed: 0, failed: 0 };
+  }
+}
+
+// Track circuit breaker state to avoid overwhelming APIs
+export async function checkCircuitBreaker(
+  serviceName: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('api_rate_limits')
+      .select('*')
+      .eq('api_name', serviceName)
+      .order('updated_at', { ascending: false })
+      .limit(config.CIRCUIT_BREAKER_THRESHOLD);
+    
+    if (error || !data || data.length < config.CIRCUIT_BREAKER_THRESHOLD) {
+      return false; // Not enough data to decide, assume circuit is closed
+    }
+    
+    // Check if we've had consecutive rate limit issues or errors
+    const recentIssues = data.filter(item => 
+      (item.requests_remaining !== null && item.requests_remaining <= 1) || 
+      (item.last_response && 
+       (item.last_response.status >= 429 || 
+        (item.last_response.status >= 500 && item.last_response.status < 600)))
+    );
+    
+    // If enough recent issues, open the circuit breaker
+    const shouldOpen = recentIssues.length >= config.CIRCUIT_BREAKER_THRESHOLD / 2;
+    
+    if (shouldOpen) {
+      // Log circuit breaker activation
+      await logSystemEvent('warning', 'circuit_breaker', 
+        `Circuit breaker opened for ${serviceName} due to ${recentIssues.length} recent issues`,
+        { serviceName, issueCount: recentIssues.length, samples: data.length }
+      );
+      
+      // Track metrics
+      await incrementMetric('circuit_breaker_activations', 1, { service: serviceName });
+    }
+    
+    return shouldOpen;
+  } catch (error) {
+    console.error('Error checking circuit breaker:', error);
+    return false; // On error, assume circuit is closed
+  }
+}
+
+// Generate a correlation ID for tracing requests through the system
+export function generateCorrelationId(): string {
+  return crypto.randomUUID();
+}
+
+// Add monitoring for batch hierarchy to see overall progress
+export async function getBatchHierarchy(
+  batchId: string
+): Promise<any> {
+  try {
+    // Get the root batch
+    const { data: rootBatch, error: rootError } = await supabase
+      .from('processing_batches')
+      .select('*')
+      .eq('id', batchId)
+      .single();
+    
+    if (rootError || !rootBatch) {
+      return null;
+    }
+    
+    // Find all child batches
+    let children = [];
+    if (rootBatch.batch_type !== 'process_album_page' && 
+        rootBatch.batch_type !== 'process_track_page') {
+      const { data: childBatches, error: childrenError } = await supabase
+        .from('processing_batches')
+        .select('*')
+        .filter('metadata->parent_batch_id', 'eq', batchId);
+      
+      if (!childrenError && childBatches) {
+        children = childBatches;
+      }
+    }
+    
+    // Return the full hierarchy
+    return {
+      ...rootBatch,
+      children
+    };
+  } catch (error) {
+    console.error('Error getting batch hierarchy:', error);
+    return null;
+  }
+}
+
+// Check if a system is experiencing backpressure (too many pending items)
+export async function checkBackpressure(
+  targetTable: string,
+  threshold: number = 1000
+): Promise<boolean> {
+  try {
+    // Check how many pending items exist for a specific table
+    const { count, error } = await supabase
+      .from('processing_items')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'pending')
+      .eq('item_type', targetTable);
+    
+    if (error) {
+      return false; // On error, assume no backpressure
+    }
+    
+    const underPressure = (count || 0) > threshold;
+    
+    if (underPressure) {
+      // Log backpressure detection
+      await logSystemEvent('warning', 'backpressure', 
+        `Backpressure detected for ${targetTable} with ${count} pending items`,
+        { targetTable, pendingCount: count, threshold }
+      );
+      
+      // Track metrics
+      await incrementMetric('backpressure_events', 1, { 
+        table: targetTable, 
+        pending_count: count 
+      });
+    }
+    
+    return underPressure;
+  } catch (error) {
+    console.error('Error checking backpressure:', error);
+    return false; // On error, assume no backpressure
+  }
+}
+
+// Track and report retry and error rates to detect problems
+export async function trackErrorRates(
+  batchType: string,
+  timeWindowMinutes: number = 15
+): Promise<{ errorRate: number; retryRate: number; alertThresholdExceeded: boolean }> {
+  try {
+    // Get recent items for this batch type
+    const startTime = new Date(Date.now() - timeWindowMinutes * 60 * 1000).toISOString();
+    
+    const { data: items, error } = await supabase
+      .from('processing_items')
+      .select('id, status, retry_count')
+      .eq('batch_type', batchType)
+      .gte('updated_at', startTime);
+    
+    if (error || !items || items.length === 0) {
+      return { errorRate: 0, retryRate: 0, alertThresholdExceeded: false };
+    }
+    
+    // Calculate rates
+    const total = items.length;
+    const errors = items.filter(item => item.status === 'error').length;
+    const retries = items.filter(item => (item.retry_count || 0) > 0).length;
+    
+    const errorRate = errors / total;
+    const retryRate = retries / total;
+    
+    // Alert threshold (configurable)
+    const alertThreshold = 0.25; // 25% error rate is concerning
+    const alertThresholdExceeded = errorRate > alertThreshold;
+    
+    if (alertThresholdExceeded) {
+      // Log alert
+      await logSystemEvent('warning', 'error_rate_alert', 
+        `High error rate detected for ${batchType}: ${(errorRate * 100).toFixed(1)}%`,
+        { batchType, errorRate, retryRate, timeWindowMinutes, total, errors, retries }
+      );
+      
+      // Track metrics
+      await incrementMetric('error_rate_alerts', 1, { 
+        batch_type: batchType, 
+        error_rate: errorRate,
+        retry_rate: retryRate
+      });
+    }
+    
+    return { errorRate, retryRate, alertThresholdExceeded };
+  } catch (error) {
+    console.error('Error tracking error rates:', error);
+    return { errorRate: 0, retryRate: 0, alertThresholdExceeded: false };
   }
 }
