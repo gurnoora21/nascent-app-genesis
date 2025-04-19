@@ -739,7 +739,6 @@ serve(async (req) => {
       };
     }
     
-    // Validate required parameters
     if (!request.batchId) {
       return new Response(
         JSON.stringify({ 
@@ -760,28 +759,41 @@ serve(async (req) => {
     
     return new Response(
       JSON.stringify(result),
-      { 
-        status: result.success ? 200 : 500, 
-        headers: { 
+      {
+        status: result.success ? 200 : 500,
+        headers: {
           'Content-Type': 'application/json',
-          ...corsHeaders 
-        } 
+          ...corsHeaders,
+        },
       }
     );
   } catch (error) {
-    console.error('Error in process-track-page function:', error);
+    console.error('Error handling process-track-page request:', error);
     
+    // Log error to our database
+    try {
+      await supabase.rpc('log_error', {
+        p_error_type: 'endpoint',
+        p_source: 'process_track_page',
+        p_message: 'Error handling process-track-page request',
+        p_stack_trace: error.stack || '',
+        p_context: { error: error.message },
+      });
+    } catch (logError) {
+      console.error('Error logging to database:', logError);
+    }
+
     return new Response(
-      JSON.stringify({ 
-        success: false, 
-        message: `Unhandled error: ${error.message}`
+      JSON.stringify({
+        success: false,
+        error: error.message,
       }),
-      { 
-        status: 500, 
-        headers: { 
+      {
+        status: 500,
+        headers: {
           'Content-Type': 'application/json',
-          ...corsHeaders 
-        } 
+          ...corsHeaders,
+        },
       }
     );
   }

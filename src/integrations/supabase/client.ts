@@ -89,7 +89,7 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
     }
     
     // Trigger the processing function
-    const { data, error } = await supabase.functions.invoke("process-artists-batch", {
+    const { data, error } = await supabase.functions.invoke("process-album-dispatcher", {
       body: {
         notifyOnCompletion: true,
         clientRequestedBatchId: batch.id
@@ -97,7 +97,7 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
     });
     
     if (error) {
-      console.error('Error calling process-artists-batch function:', error);
+      console.error('Error calling process-album-dispatcher function:', error);
       return {
         success: false,
         message: `Error: ${error.message}`,

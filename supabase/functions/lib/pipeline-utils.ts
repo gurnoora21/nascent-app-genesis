@@ -1,10 +1,148 @@
 
-// Pipeline utilities for the Spotify data pipeline
-
 import { supabase } from "./api-clients.ts";
-import type { DataQualityScore, SystemLogEntry, BatchStatus, MetricDimensions } from "./types.ts";
+import { MetricDimensions } from "./types.ts";
 
-// Format Spotify release date to work with PostgreSQL date type
+// Log a system event to the database
+export async function logSystemEvent(
+  level: 'info' | 'warning' | 'error' | 'debug',
+  component: string,
+  message: string,
+  context: any = {},
+  trace_id?: string
+): Promise<void> {
+  try {
+    await supabase
+      .from('system_logs')
+      .insert({
+        log_level: level,
+        component,
+        message,
+        context,
+        trace_id
+      });
+  } catch (error) {
+    console.error(`Error logging system event: ${error.message}`, {
+      level, component, message, context
+    });
+  }
+}
+
+// Update API rate limits based on response headers
+export async function updateRateLimit(
+  apiName: string,
+  endpoint: string,
+  headers: Headers,
+  metadata: any = {}
+): Promise<void> {
+  try {
+    // Extract rate limit headers - different APIs use different header formats
+    const requestsRemaining = parseInt(
+      headers.get('x-ratelimit-remaining') || 
+      headers.get('X-RateLimit-Remaining') || 
+      headers.get('ratelimit-remaining') || 
+      '-1'
+    );
+
+    const requestsLimit = parseInt(
+      headers.get('x-ratelimit-limit') || 
+      headers.get('X-RateLimit-Limit') || 
+      headers.get('ratelimit-limit') || 
+      '-1'
+    );
+
+    // Parse reset time (could be in seconds or as a timestamp)
+    let resetAt: Date | null = null;
+    const resetValue = headers.get('x-ratelimit-reset') || 
+                     headers.get('X-RateLimit-Reset') ||
+                     headers.get('ratelimit-reset');
+    
+    if (resetValue) {
+      // Check if it's a timestamp or seconds from now
+      const resetNum = parseInt(resetValue);
+      if (resetNum > 0) {
+        // If it's a Unix timestamp (usually > 1600000000)
+        if (resetNum > 1600000000) {
+          resetAt = new Date(resetNum * 1000); // Convert from Unix timestamp
+        } else {
+          // It's seconds from now
+          resetAt = new Date(Date.now() + (resetNum * 1000));
+        }
+      }
+    }
+
+    // Log the rate limit if found
+    if (requestsLimit > 0 || requestsRemaining >= 0 || resetAt) {
+      await supabase
+        .from('api_rate_limits')
+        .upsert({
+          api_name: apiName,
+          endpoint: endpoint,
+          requests_limit: requestsLimit > 0 ? requestsLimit : undefined,
+          requests_remaining: requestsRemaining >= 0 ? requestsRemaining : undefined,
+          reset_at: resetAt ? resetAt.toISOString() : undefined,
+          last_response: metadata
+        }, {
+          onConflict: 'api_name,endpoint'
+        });
+    }
+  } catch (error) {
+    console.error(`Error updating rate limits: ${error.message}`, {
+      apiName, endpoint
+    });
+  }
+}
+
+// Check if an API endpoint is rate limited
+export async function isApiRateLimited(
+  apiName: string,
+  endpoint: string
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('api_rate_limits')
+      .select('*')
+      .eq('api_name', apiName)
+      .eq('endpoint', endpoint)
+      .single();
+    
+    if (error || !data) {
+      return false;
+    }
+    
+    // If we're out of requests and reset time is in the future
+    if (
+      data.requests_remaining !== null && 
+      data.requests_remaining <= 0 && 
+      data.reset_at && 
+      new Date(data.reset_at) > new Date()
+    ) {
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error(`Error checking rate limits: ${error.message}`);
+    return false;
+  }
+}
+
+// Calculate backoff time with jitter
+export function calculateBackoffMs(retryCount: number, baseDelay = 1000): number {
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
+  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
+  
+  // Add random jitter (±25%)
+  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
+  
+  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
+}
+
+// Sleep for a specified period
+export function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Format Spotify release dates
 export function formatSpotifyReleaseDate(releaseDate: string | null): string | null {
   if (!releaseDate) return null;
   
@@ -26,131 +164,28 @@ export function formatSpotifyReleaseDate(releaseDate: string | null): string | n
   }
 }
 
-// Generate a unique correlation ID for tracing
-export function generateCorrelationId(): string {
-  return crypto.randomUUID();
-}
-
-// Log system events with consistent formatting
-export async function logSystemEvent(
-  level: 'info' | 'warning' | 'error' | 'debug',
-  component: string,
-  message: string,
-  context?: any,
-  traceId?: string
+// Increment a metric for observability
+export async function incrementMetric(
+  metricName: string,
+  value: number = 1,
+  dimensions: MetricDimensions = {}
 ): Promise<void> {
   try {
-    const logEntry: SystemLogEntry = {
-      level,
-      component,
-      message,
-      context,
-      trace_id: traceId
-    };
-    
-    // For local testing and debugging
-    console.log(`${level.toUpperCase()} [${component}]: ${message}`);
-    if (context) {
-      console.log(`Context: ${JSON.stringify(context)}`);
-    }
-    
-    // Log to system_logs table
-    await supabase
-      .from('system_logs')
-      .insert(logEntry);
-  } catch (error) {
-    // If logging fails, at least output to console
-    console.error(`Failed to log event: ${error.message}`);
-    console.error(`Original message: ${message}`);
-  }
-}
-
-// Check if an API is currently rate limited
-export async function isApiRateLimited(
-  apiName: string,
-  endpoint: string
-): Promise<boolean> {
-  try {
-    const { data, error } = await supabase
-      .from("api_rate_limits")
-      .select("*")
-      .eq("api_name", apiName)
-      .eq("endpoint", endpoint)
-      .single();
-    
-    if (error || !data) return false;
-    
-    // If we're out of requests and reset time is in the future
-    if (
-      data.requests_remaining !== null && 
-      data.requests_remaining <= 0 && 
-      data.reset_at && 
-      new Date(data.reset_at) > new Date()
-    ) {
-      return true;
-    }
-    
-    return false;
-  } catch (err) {
-    console.error("Error checking rate limits:", err);
-    return false;
-  }
-}
-
-// Update API rate limits based on response headers
-export async function updateRateLimit(
-  apiName: string,
-  endpoint: string,
-  headers: Headers,
-  context: { status: number }
-): Promise<void> {
-  try {
-    // Extract rate limit info from headers
-    const remaining = headers.get('x-ratelimit-remaining') || headers.get('ratelimit-remaining');
-    const limit = headers.get('x-ratelimit-limit') || headers.get('ratelimit-limit');
-    const reset = headers.get('x-ratelimit-reset') || headers.get('ratelimit-reset');
-    
-    if (!remaining && !limit && !reset) {
-      // Some APIs don't include rate limit headers in every response
-      return;
-    }
-    
-    let resetDate: Date | null = null;
-    
-    if (reset) {
-      // Reset could be a timestamp or seconds from now
-      if (reset.length > 10) {
-        // Timestamp in milliseconds
-        resetDate = new Date(parseInt(reset));
-      } else {
-        // Seconds from now
-        resetDate = new Date(Date.now() + parseInt(reset) * 1000);
+    await logSystemEvent('info', 'metrics', 
+      `${metricName}:${value}`,
+      {
+        metric_name: metricName,
+        value,
+        dimensions,
+        timestamp: new Date().toISOString()
       }
-    }
-    
-    // Upsert into api_rate_limits table
-    await supabase
-      .from('api_rate_limits')
-      .upsert({
-        api_name: apiName,
-        endpoint: endpoint,
-        requests_remaining: remaining ? parseInt(remaining) : null,
-        requests_limit: limit ? parseInt(limit) : null,
-        reset_at: resetDate ? resetDate.toISOString() : null,
-        last_response: {
-          status: context.status,
-          timestamp: new Date().toISOString()
-        },
-        updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'api_name,endpoint'
-      });
+    );
   } catch (error) {
-    console.error('Error updating rate limits:', error);
+    console.error(`Error incrementing metric ${metricName}: ${error.message}`);
   }
 }
 
-// Update data quality score for an entity
+// Update data quality score
 export async function updateDataQualityScore(
   entityType: string,
   entityId: string,
@@ -158,305 +193,111 @@ export async function updateDataQualityScore(
   qualityScore: number,
   completenessScore?: number,
   accuracyScore?: number,
-  metadata?: any
+  metadata: any = {}
 ): Promise<void> {
   try {
-    const dataQualityScore: DataQualityScore = {
-      entity_type: entityType,
-      entity_id: entityId,
-      source: source,
-      quality_score: qualityScore,
-      completeness_score: completenessScore,
-      accuracy_score: accuracyScore,
-      metadata: metadata || {}
-    };
+    // Check if a score already exists
+    const { data: existingScore, error: queryError } = await supabase
+      .from('data_quality_scores')
+      .select('id')
+      .eq('entity_type', entityType)
+      .eq('entity_id', entityId)
+      .eq('source', source)
+      .maybeSingle();
     
+    if (queryError) {
+      console.error(`Error checking for existing quality score: ${queryError.message}`);
+      return;
+    }
+    
+    // Upsert the score
     await supabase
       .from('data_quality_scores')
-      .upsert(dataQualityScore, {
+      .upsert({
+        entity_type: entityType,
+        entity_id: entityId,
+        source: source,
+        quality_score: qualityScore,
+        completeness_score: completenessScore,
+        accuracy_score: accuracyScore,
+        last_verified_at: new Date().toISOString(),
+        metadata: {
+          ...metadata,
+          updated_at: new Date().toISOString()
+        }
+      }, {
         onConflict: 'entity_type,entity_id,source'
       });
   } catch (error) {
-    console.error('Error updating data quality score:', error);
+    console.error(`Error updating data quality score: ${error.message}`);
   }
 }
 
-// Update the status of a processing item
-export async function updateItemStatus(
-  itemId: string,
-  status: 'pending' | 'processing' | 'completed' | 'error',
-  errorMessage?: string,
-  metadata?: any
+// Register a worker heartbeat
+export async function registerWorkerHeartbeat(
+  workerId: string,
+  workerType: string,
+  status: string = 'active',
+  currentBatchId?: string,
+  metadata: any = {}
 ): Promise<void> {
   try {
-    const updateData: any = {
-      status,
-      updated_at: new Date().toISOString()
-    };
-    
-    if (errorMessage) {
-      updateData.last_error = errorMessage;
-    }
-    
-    if (metadata) {
-      updateData.metadata = metadata;
-    }
-    
     await supabase
-      .from('processing_items')
-      .update(updateData)
-      .eq('id', itemId);
+      .from('worker_heartbeats')
+      .upsert({
+        worker_id: workerId,
+        worker_type: workerType,
+        status,
+        current_batch_id: currentBatchId,
+        last_heartbeat: new Date().toISOString(),
+        metadata: {
+          ...metadata,
+          updated_at: new Date().toISOString()
+        }
+      }, {
+        onConflict: 'worker_id'
+      });
   } catch (error) {
-    console.error('Error updating item status:', error);
+    console.error(`Error registering worker heartbeat: ${error.message}`);
   }
 }
 
-// Calculate backoff time based on retry count with jitter
-export function calculateBackoffMs(retryCount: number, baseDelay = 1000): number {
-  // Exponential backoff: 1s, 2s, 4s, 8s, 16s...
-  const exponentialDelay = baseDelay * Math.pow(2, retryCount);
-  
-  // Add random jitter (±25%)
-  const jitter = exponentialDelay * 0.25 * (Math.random() * 2 - 1);
-  
-  return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
-}
-
-// Sleep for a specified number of milliseconds
-export function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Increment a metric with dimensions
-export async function incrementMetric(
-  metricName: string,
-  value: number = 1,
-  dimensions: MetricDimensions = {}
-): Promise<void> {
+// Send an item to the dead letter queue
+export async function sendToDeadLetterQueue(
+  originalItemId: string,
+  originalBatchId: string,
+  itemType: string,
+  itemId: string,
+  errorMessage: string,
+  metadata: any = {},
+  retryCount: number = 0
+): Promise<string | null> {
   try {
-    await supabase.rpc('increment_metric', {
-      p_metric_name: metricName,
-      p_value: value,
-      p_dimensions: dimensions
-    });
-  } catch (error) {
-    console.error(`Error incrementing metric ${metricName}:`, error);
-  }
-}
-
-// Check if a batch is complete
-export async function checkBatchCompletion(batchId: string): Promise<{
-  complete: boolean;
-  total: number;
-  completed: number;
-  failed: number;
-}> {
-  try {
-    // Get item counts for this batch
     const { data, error } = await supabase
-      .from('processing_items')
-      .select('status', { count: 'exact' })
-      .eq('batch_id', batchId);
+      .from('dead_letter_items')
+      .insert({
+        original_item_id: originalItemId,
+        original_batch_id: originalBatchId,
+        item_type: itemType,
+        item_id: itemId,
+        error_message: errorMessage,
+        retry_count: retryCount,
+        metadata: {
+          ...metadata,
+          sent_at: new Date().toISOString()
+        }
+      })
+      .select('id')
+      .single();
     
     if (error) {
-      console.error(`Error checking batch completion: ${error.message}`);
-      return { complete: false, total: 0, completed: 0, failed: 0 };
+      console.error(`Error sending to dead letter queue: ${error.message}`);
+      return null;
     }
     
-    const total = data.length;
-    const completed = data.filter(item => item.status === 'completed').length;
-    const failed = data.filter(item => item.status === 'error').length;
-    const pending = data.filter(item => item.status === 'pending' || item.status === 'processing').length;
-    
-    return {
-      complete: pending === 0 && total > 0,
-      total,
-      completed,
-      failed
-    };
+    return data.id;
   } catch (error) {
-    console.error(`Error in checkBatchCompletion: ${error.message}`);
-    return { complete: false, total: 0, completed: 0, failed: 0 };
-  }
-}
-
-// Validate batch integrity before processing
-export async function validateBatchIntegrity(batchId: string): Promise<{valid: boolean, reason?: string}> {
-  try {
-    // Check if batch exists
-    const { data: batch, error: batchError } = await supabase
-      .from("processing_batches")
-      .select("*")
-      .eq("id", batchId)
-      .single();
-    
-    if (batchError || !batch) {
-      return { valid: false, reason: `Batch ${batchId} not found` };
-    }
-    
-    // Check if batch is in a valid state
-    if (batch.status !== 'pending' && batch.status !== 'processing') {
-      return { valid: false, reason: `Batch ${batchId} is in ${batch.status} state, not processable` };
-    }
-    
-    // Check if there are pending items
-    const { count, error: countError } = await supabase
-      .from("processing_items")
-      .select("*", { count: "exact", head: true })
-      .eq("batch_id", batchId)
-      .eq("status", "pending");
-    
-    if (countError) {
-      return { valid: false, reason: `Error checking pending items: ${countError.message}` };
-    }
-    
-    if (count === 0) {
-      return { valid: false, reason: `No pending items in batch ${batchId}` };
-    }
-    
-    return { valid: true };
-  } catch (err) {
-    console.error("Error validating batch integrity:", err);
-    return { valid: false, reason: `Exception during validation: ${err.message}` };
-  }
-}
-
-// Check if a circuit breaker is open for an API
-export async function checkCircuitBreaker(apiName: string): Promise<boolean> {
-  try {
-    const { data, error } = await supabase
-      .from('api_rate_limits')
-      .select('*')
-      .eq('api_name', apiName)
-      .is('circuit_breaker_until', 'not.null')
-      .order('updated_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    if (error || !data) {
-      return false;
-    }
-    
-    if (data.circuit_breaker_until && new Date(data.circuit_breaker_until) > new Date()) {
-      return true; // Circuit breaker is active
-    }
-    
-    return false;
-  } catch (error) {
-    console.error(`Error checking circuit breaker: ${error.message}`);
-    return false;
-  }
-}
-
-// Check for backpressure in the processing queues
-export async function checkBackpressure(): Promise<{
-  backpressure: boolean;
-  pendingBatches: number;
-  pendingItems: number;
-}> {
-  try {
-    // Count pending batches
-    const { count: pendingBatchCount, error: batchError } = await supabase
-      .from('processing_batches')
-      .select('*', { count: 'exact', head: true })
-      .eq('status', 'pending');
-    
-    // Count pending items
-    const { count: pendingItemCount, error: itemError } = await supabase
-      .from('processing_items')
-      .select('*', { count: 'exact', head: true })
-      .eq('status', 'pending');
-    
-    const pendingBatches = pendingBatchCount || 0;
-    const pendingItems = pendingItemCount || 0;
-    
-    // Define thresholds for backpressure
-    const BATCH_THRESHOLD = 1000; // Too many pending batches
-    const ITEM_THRESHOLD = 10000; // Too many pending items
-    
-    const backpressure = pendingBatches > BATCH_THRESHOLD || pendingItems > ITEM_THRESHOLD;
-    
-    return {
-      backpressure,
-      pendingBatches,
-      pendingItems
-    };
-  } catch (error) {
-    console.error(`Error checking backpressure: ${error.message}`);
-    return {
-      backpressure: false,
-      pendingBatches: 0,
-      pendingItems: 0
-    };
-  }
-}
-
-// Track error rates across different batch types
-export async function trackErrorRates(batchType: string): Promise<{
-  errorRate: number;
-  retryRate: number;
-  alertThresholdExceeded: boolean;
-}> {
-  try {
-    // Look at batches completed in the last 24 hours
-    const timeWindow = new Date();
-    timeWindow.setHours(timeWindow.getHours() - 24);
-    
-    // Get completed batches
-    const { data: batches, error: batchError } = await supabase
-      .from('processing_batches')
-      .select('items_total, items_processed, items_failed')
-      .eq('batch_type', batchType)
-      .in('status', ['completed', 'partial', 'error'])
-      .gte('updated_at', timeWindow.toISOString());
-    
-    if (batchError || !batches || batches.length === 0) {
-      return {
-        errorRate: 0,
-        retryRate: 0,
-        alertThresholdExceeded: false
-      };
-    }
-    
-    // Calculate totals
-    let totalItems = 0;
-    let totalProcessed = 0;
-    let totalFailed = 0;
-    
-    batches.forEach(batch => {
-      totalItems += batch.items_total || 0;
-      totalProcessed += batch.items_processed || 0;
-      totalFailed += batch.items_failed || 0;
-    });
-    
-    // Calculate error rate
-    const errorRate = totalItems > 0 ? totalFailed / totalItems : 0;
-    
-    // Get retry information
-    const { data: retryData, error: retryError } = await supabase
-      .from('processing_items')
-      .select('retry_count')
-      .eq('status', 'error')
-      .gt('retry_count', 0)
-      .gte('updated_at', timeWindow.toISOString());
-    
-    const totalRetries = retryData ? retryData.length : 0;
-    const retryRate = totalFailed > 0 ? totalRetries / totalFailed : 0;
-    
-    // Check if error rate exceeds threshold for alerting
-    const alertThresholdExceeded = errorRate > 0.25 && totalItems > 10;
-    
-    return {
-      errorRate,
-      retryRate,
-      alertThresholdExceeded
-    };
-  } catch (error) {
-    console.error(`Error tracking error rates: ${error.message}`);
-    return {
-      errorRate: 0,
-      retryRate: 0,
-      alertThresholdExceeded: false
-    };
+    console.error(`Error sending to dead letter queue: ${error.message}`);
+    return null;
   }
 }

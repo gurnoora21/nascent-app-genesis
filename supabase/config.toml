@@ -13,27 +13,23 @@ port = 54322
 enabled = true
 port = 54323
 
-# Renamed function (was process-albums-batch)
+# Album processing functions
 [functions.process-album-dispatcher]
 verify_jwt = false
 
-# Keep existing process-album-page function
 [functions.process-album-page]
 verify_jwt = false
 
-# Keep existing process-track-page function
 [functions.process-track-page]
 verify_jwt = false
 
-# Keep existing process-artists-batch function
+# Additional pipeline functions
 [functions.process-artists-batch]
 verify_jwt = false
 
-# Keep existing monitor-pipeline function
 [functions.monitor-pipeline]
 verify_jwt = false
 
-# Other existing functions
 [functions.process-producers-batch]
 verify_jwt = false
 
