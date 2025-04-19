@@ -276,7 +276,10 @@ export async function getBatchHierarchy(batchId: string): Promise<{
     }
     
     // Check if this batch has a parent
-    const parentBatchId = batch.metadata?.parent_batch_id;
+    const parentBatchId = batch.metadata && typeof batch.metadata === 'object' && 'parent_batch_id' in batch.metadata 
+      ? batch.metadata.parent_batch_id 
+      : null;
+    
     let parentBatch = null;
     
     if (parentBatchId) {
