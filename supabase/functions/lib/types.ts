@@ -70,8 +70,7 @@ export type DeadLetterItem = {
 // Paginated batch types
 export type BatchType = 
   | 'process_artists'       // Main artist processing batch
-  | 'process_albums'        // Main album processing batch 
-  | 'process_tracks'        // Main tracks processing batch
+  | 'process_albums'        // Album dispatcher batch
   | 'process_album_page'    // Process a single page of albums for an artist
   | 'process_track_page'    // Process a single page of tracks for an album
   | 'process_producers';    // Main producer processing batch
@@ -81,6 +80,8 @@ export type BatchStatus =
   | 'pending'       // Waiting to be processed
   | 'processing'    // Currently being processed
   | 'completed'     // Successfully processed
+  | 'completed_with_next' // Completed but with more pages to process
+  | 'tracks_completed' // All tracks for this item are processed
   | 'partial'       // Partially completed (some items failed)
   | 'error'         // Failed to process
   | 'cancelled';    // Manually cancelled
@@ -88,9 +89,8 @@ export type BatchStatus =
 // Item type for processing queue
 export type ItemType =
   | 'artist'            // Main artist record
-  | 'album'             // Album record 
-  | 'album_for_tracks'  // Album to process for tracks
-  | 'track'             // Track record
+  | 'album_page'        // Page of albums to process 
+  | 'track_page'        // Page of tracks to process
   | 'producer';         // Producer record
 
 // Data sources

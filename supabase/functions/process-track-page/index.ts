@@ -1,3 +1,4 @@
+
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
 import { 
   logSystemEvent, 
@@ -23,7 +24,9 @@ interface TrackPageRequest {
   limit?: number;
   albumId?: string;
   correlationId?: string;
-  parentAlbumBatchId?: string; // Track which album batch this belongs to
+  parentAlbumBatchId?: string;
+  pageIndex?: number;
+  totalPages?: number;
 }
 
 async function processTrackPage(request: TrackPageRequest): Promise<{
@@ -77,11 +80,23 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       throw new Error(`Batch ${batchId} not found: ${batchError?.message || 'No data returned'}`);
     }
     
+    // Mark batch as processing
+    await supabase
+      .from('processing_batches')
+      .update({
+        status: 'processing',
+        started_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', batchId);
+    
     // Extract pagination parameters
     const offset = request.offset || batch.metadata?.offset || 0;
     const limit = request.limit || batch.metadata?.limit || 50;
     const albumId = request.albumId || batch.metadata?.album_id;
     const parentAlbumBatchId = request.parentAlbumBatchId || batch.metadata?.parent_album_batch_id;
+    const pageIndex = request.pageIndex || batch.metadata?.page_index || 0;
+    const totalPages = request.totalPages || batch.metadata?.total_pages || 1;
     
     // Get album details
     const { data: album, error: albumError } = await supabase
@@ -114,8 +129,8 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
     
     // Fetch tracks from Spotify
     await logSystemEvent('info', 'process_track_page', 
-      `Fetching tracks for album ${album.name} by ${artistName} (offset: ${offset}, limit: ${limit})`, 
-      { albumId, albumName: album.name, artistName, offset, limit, traceId },
+      `Fetching tracks for album ${album.name} by ${artistName} (offset: ${offset}, limit: ${limit}, page ${pageIndex+1}/${totalPages})`, 
+      { albumId, albumName: album.name, artistName, offset, limit, pageIndex, totalPages, traceId },
       traceId
     );
     
@@ -130,7 +145,11 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       throw new Error(`Error fetching tracks from Spotify: ${spotifyError.message}`);
     }
     
+    let isFinal = false;
+    
     if (!tracks || tracks.length === 0) {
+      isFinal = true;
+      
       const finalStatus = {
         status: 'completed',
         items_total: 0,
@@ -144,7 +163,9 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
           processing_time_ms: Date.now() - startTime,
           success_rate: 1,
           offset,
-          limit
+          limit,
+          page_index: pageIndex,
+          total_pages: totalPages
         }
       };
 
@@ -197,8 +218,10 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       await sleep(200);
     }
     
-    // Calculate if this was the final page and success metrics
-    const isFinal = tracks.length < limit;
+    // Determine if this is the final page
+    isFinal = tracks.length < limit || (pageIndex === totalPages - 1);
+    
+    // Calculate success metrics
     const successRate = processedTracks.length / tracks.length;
     
     // Update batch status with pagination metadata
@@ -208,6 +231,8 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
         ...batch.metadata,
         offset,
         limit,
+        page_index: pageIndex,
+        total_pages: totalPages,
         is_final_page: isFinal,
         next_page_offset: isFinal ? null : offset + limit,
         processing_time_ms: Date.now() - startTime,
@@ -231,6 +256,7 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
     let nextPageScheduled = false;
     if (!isFinal) {
       const nextOffset = offset + limit;
+      const nextPageIndex = pageIndex + 1;
       
       edgeRuntime.waitUntil(
         supabase.from('processing_batches')
@@ -239,18 +265,33 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
             status: 'pending',
             metadata: {
               album_id: albumId,
+              album_name: album.name,
               parent_album_batch_id: parentAlbumBatchId,
               offset: nextOffset,
               limit,
+              page_index: nextPageIndex,
+              total_pages: totalPages,
               correlation_id: traceId,
               source: 'pagination'
             }
           })
-          .then(async ({ error: nextPageError }) => {
+          .then(async ({ data: nextBatch, error: nextPageError }) => {
             if (nextPageError) {
               await logSystemEvent('error', 'process_track_page',
                 `Error scheduling next page: ${nextPageError.message}`,
-                { albumId, offset: nextOffset, traceId },
+                { albumId, offset: nextOffset, pageIndex: nextPageIndex, traceId },
+                traceId
+              );
+            } else if (nextBatch) {
+              await logSystemEvent('info', 'process_track_page',
+                `Scheduled next page batch: ${nextBatch[0].id}`,
+                { 
+                  albumId, 
+                  nextBatchId: nextBatch[0].id, 
+                  offset: nextOffset, 
+                  pageIndex: nextPageIndex, 
+                  traceId 
+                },
                 traceId
               );
             }
@@ -565,37 +606,85 @@ async function updateParentAlbumBatch(
       throw new Error(`Error checking track batches: ${batchError.message}`);
     }
 
+    if (!trackBatches || trackBatches.length === 0) {
+      await logSystemEvent('warning', 'update_parent_album_batch',
+        `No track page batches found for album ${albumId}`,
+        { parentBatchId, albumId, traceId },
+        traceId
+      );
+      return;
+    }
+
     // Check if all track pages are completed and find the final page
-    const allCompleted = trackBatches?.every(batch => 
-      batch.status === 'completed' || batch.status === 'completed_with_next'
+    const allCompleted = trackBatches.every(batch => 
+      batch.status === 'completed' || batch.status === 'completed_with_next' || batch.status === 'error'
     );
 
-    const hasFinalPage = trackBatches?.some(batch => 
+    const hasFinalPage = trackBatches.some(batch => 
       batch.metadata?.is_final_page === true
     );
 
     if (allCompleted && hasFinalPage) {
-      await logSystemEvent('info', 'process_track_page',
+      await logSystemEvent('info', 'update_parent_album_batch',
         `All track pages completed for album ${albumId}`,
-        { parentBatchId, albumId, traceId },
+        { parentBatchId, albumId, batchCount: trackBatches.length, traceId },
         traceId
       );
       
-      // Update the parent album batch
-      const { error: updateError } = await supabase
-        .from('processing_batches')
-        .update({
-          status: 'tracks_completed',
-          updated_at: new Date().toISOString(),
-          metadata: {
-            tracks_completed_at: new Date().toISOString(),
-            tracks_correlation_id: traceId
-          }
-        })
-        .eq('id', parentBatchId);
+      // Update the album item in parent batch as completed
+      const { data: albumItems, error: itemsError } = await supabase
+        .from('processing_items')
+        .select('id')
+        .eq('batch_id', parentBatchId)
+        .eq('item_id', albumId)
+        .eq('item_type', 'album_for_tracks');
       
-      if (updateError) {
-        throw new Error(`Error updating parent batch: ${updateError.message}`);
+      if (!itemsError && albumItems && albumItems.length > 0) {
+        await supabase
+          .from('processing_items')
+          .update({
+            status: 'completed',
+            updated_at: new Date().toISOString(),
+            metadata: {
+              tracks_completed_at: new Date().toISOString(),
+              tracks_correlation_id: traceId
+            }
+          })
+          .eq('id', albumItems[0].id);
+      }
+      
+      // Check if all albums in the batch are now completed
+      const { data: allItems, error: allItemsError } = await supabase
+        .from('processing_items')
+        .select('id, status')
+        .eq('batch_id', parentBatchId);
+      
+      if (!allItemsError && allItems) {
+        const allItemsCompleted = allItems.every(item => 
+          item.status === 'completed' || item.status === 'error'
+        );
+        
+        if (allItemsCompleted) {
+          // All albums are completed, mark the parent batch as completed
+          await supabase
+            .from('processing_batches')
+            .update({
+              status: 'tracks_completed',
+              completed_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+              metadata: {
+                tracks_completed_at: new Date().toISOString(),
+                tracks_correlation_id: traceId
+              }
+            })
+            .eq('id', parentBatchId);
+          
+          await logSystemEvent('info', 'update_parent_album_batch',
+            `Marked parent batch ${parentBatchId} as tracks_completed`,
+            { parentBatchId, traceId },
+            traceId
+          );
+        }
       }
     }
   } catch (error) {
@@ -644,7 +733,9 @@ serve(async (req) => {
         limit: parseInt(url.searchParams.get('limit') || '50'),
         albumId: url.searchParams.get('albumId') || undefined,
         correlationId: url.searchParams.get('correlationId') || undefined,
-        parentAlbumBatchId: url.searchParams.get('parentAlbumBatchId') || undefined
+        parentAlbumBatchId: url.searchParams.get('parentAlbumBatchId') || undefined,
+        pageIndex: parseInt(url.searchParams.get('pageIndex') || '0'),
+        totalPages: parseInt(url.searchParams.get('totalPages') || '1')
       };
     }
     

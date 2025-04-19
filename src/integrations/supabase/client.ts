@@ -483,14 +483,17 @@ export async function monitorBatchProgress(batchId: string): Promise<{
     if (hierarchy.children && hierarchy.children.length > 0) {
       pagesTotal = hierarchy.children.length;
       pagesCompleted = hierarchy.children.filter((b: any) => 
-        b.status === 'completed' || b.status === 'error'
+        b.status === 'completed' || 
+        b.status === 'completed_with_next' || 
+        b.status === 'error'
       ).length;
       
       // If some pages are complete, we can estimate time remaining
       if (pagesCompleted > 0 && pagesTotal > pagesCompleted) {
         // Find the average time per page for completed pages
         const completedPages = hierarchy.children.filter((b: any) => 
-          b.status === 'completed' && b.started_at && b.completed_at
+          (b.status === 'completed' || b.status === 'completed_with_next') && 
+          b.started_at && b.completed_at
         );
         
         if (completedPages.length > 0) {

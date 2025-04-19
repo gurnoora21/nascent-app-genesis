@@ -26,6 +26,9 @@ interface AlbumPageRequest {
   limit?: number;
   artistId?: string;
   correlationId?: string;
+  parentBatchId?: string;
+  pageIndex?: number;
+  totalPages?: number;
 }
 
 async function processAlbumPage(request: AlbumPageRequest): Promise<{
@@ -35,6 +38,7 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
   processed?: number;
   failed?: number;
   status?: string;
+  nextPageScheduled?: boolean;
 }> {
   const { batchId, correlationId } = request;
   const processedAlbums: string[] = [];
@@ -97,6 +101,9 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
     const limit = request.limit || batch.metadata?.limit || 20;
     const artistId = request.artistId || batch.metadata?.artist_id;
     const artistName = batch.metadata?.artist_name || 'Unknown';
+    const parentBatchId = request.parentBatchId || batch.metadata?.parent_batch_id;
+    const pageIndex = request.pageIndex || batch.metadata?.page_index || 0;
+    const totalPages = request.totalPages || batch.metadata?.total_pages || 1;
     
     // Ensure we have an artist ID
     if (!artistId) {
@@ -116,8 +123,8 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
     
     // Check for existing albums
     await logSystemEvent('info', 'process_album_page', 
-      `Fetching albums for artist ${artist.name} (offset: ${offset}, limit: ${limit})`, 
-      { artistId, artistName: artist.name, offset, limit, traceId },
+      `Fetching albums for artist ${artist.name} (offset: ${offset}, limit: ${limit}, page ${pageIndex+1}/${totalPages})`, 
+      { artistId, artistName: artist.name, offset, limit, pageIndex, totalPages, traceId },
       traceId
     );
     
@@ -133,12 +140,17 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
       throw new Error(`Error fetching albums from Spotify: ${spotifyError.message}`);
     }
     
+    let isFinal = false;
+    
+    // Either no albums in this page, or less than the limit (end of collection)
     if (!albums || albums.length === 0) {
       await logSystemEvent('info', 'process_album_page', 
         `No albums found for artist ${artist.name} at offset ${offset}`, 
-        { artistId, artistName: artist.name, offset, limit, traceId },
+        { artistId, artistName: artist.name, offset, limit, pageIndex, totalPages, traceId },
         traceId
       );
+      
+      isFinal = true;
       
       // Update batch as completed since there's nothing to process
       await supabase
@@ -149,9 +161,26 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
           items_processed: 0,
           items_failed: 0,
           completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
+          metadata: {
+            ...batch.metadata,
+            offset,
+            limit,
+            page_index: pageIndex,
+            total_pages: totalPages,
+            is_final_page: true,
+            processing_time_ms: Date.now() - startTime,
+            completed_at: new Date().toISOString()
+          }
         })
         .eq('id', batchId);
+      
+      // If this was the final page, update parent batch
+      if (parentBatchId) {
+        edgeRuntime.waitUntil(
+          updateParentArtistBatch(parentBatchId, artistId, traceId)
+        );
+      }
       
       return {
         success: true,
@@ -162,21 +191,6 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
         status: 'completed'
       };
     }
-    
-    // Process each album
-    await logSystemEvent('info', 'process_album_page', 
-      `Processing ${albums.length} albums for artist ${artist.name}`, 
-      { artistId, artistName: artist.name, albumCount: albums.length, traceId },
-      traceId
-    );
-    
-    // Update batch with total item count
-    await supabase
-      .from('processing_batches')
-      .update({
-        items_total: albums.length
-      })
-      .eq('id', batchId);
     
     // Process albums in smaller batches to avoid DB connection issues
     const batchSize = 5;
@@ -221,37 +235,109 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
       artist_name: artist.name.substring(0, 50)
     });
     
+    // Determine if this is the final page
+    isFinal = albums.length < limit || (pageIndex === totalPages - 1);
+    
     // Calculate processing time and success rate
     const processingTimeMs = Date.now() - startTime;
     const successRate = processedAlbums.length / albums.length;
     
-    // Update batch status
+    // Update batch status with pagination metadata
+    const batchStatus = {
+      status: isFinal ? 'completed' : 'completed_with_next',
+      metadata: {
+        ...batch.metadata,
+        offset,
+        limit,
+        page_index: pageIndex,
+        total_pages: totalPages,
+        is_final_page: isFinal,
+        next_page_offset: isFinal ? null : offset + limit,
+        processing_time_ms: processingTimeMs,
+        success_rate: successRate,
+        completed_at: new Date().toISOString()
+      },
+      items_total: albums.length,
+      items_processed: processedAlbums.length,
+      items_failed: failedAlbums.length,
+      completed_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    
+    // Update batch with new status
     await supabase
       .from('processing_batches')
-      .update({
-        status: 'completed',
-        items_total: albums.length,
-        items_processed: processedAlbums.length,
-        items_failed: failedAlbums.length,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        metadata: {
-          ...batch.metadata,
-          processing_time_ms: processingTimeMs,
-          success_rate: successRate,
-          completed_at: new Date().toISOString()
-        }
-      })
+      .update(batchStatus)
       .eq('id', batchId);
     
+    // Schedule next page processing if not final
+    let nextPageScheduled = false;
+    if (!isFinal) {
+      // Schedule next page via a new batch
+      const nextOffset = offset + limit;
+      const nextPageIndex = pageIndex + 1;
+      
+      edgeRuntime.waitUntil(
+        supabase.from('processing_batches')
+          .insert({
+            batch_type: 'process_album_page',
+            status: 'pending',
+            metadata: {
+              artist_id: artistId,
+              artist_name: artist.name,
+              spotify_id: artist.spotify_id,
+              parent_batch_id: parentBatchId,
+              offset: nextOffset,
+              limit,
+              page_index: nextPageIndex,
+              total_pages: totalPages,
+              correlation_id: traceId,
+              source: 'pagination'
+            }
+          })
+          .then(async ({ data: nextBatch, error: nextPageError }) => {
+            if (nextPageError) {
+              await logSystemEvent('error', 'process_album_page',
+                `Error scheduling next page: ${nextPageError.message}`,
+                { artistId, offset: nextOffset, pageIndex: nextPageIndex, traceId },
+                traceId
+              );
+            } else if (nextBatch) {
+              await logSystemEvent('info', 'process_album_page',
+                `Scheduled next page batch: ${nextBatch[0].id}`,
+                { 
+                  artistId, 
+                  nextBatchId: nextBatch[0].id, 
+                  offset: nextOffset, 
+                  pageIndex: nextPageIndex, 
+                  traceId 
+                },
+                traceId
+              );
+            }
+          })
+      );
+      
+      nextPageScheduled = true;
+    }
+    
+    // If this was the final page, update parent batch
+    if (isFinal && parentBatchId) {
+      edgeRuntime.waitUntil(
+        updateParentArtistBatch(parentBatchId, artistId, traceId)
+      );
+    }
+    
     await logSystemEvent('info', 'process_album_page', 
-      `Completed album page processing for batch ${batchId}. Processed: ${processedAlbums.length}, Failed: ${failedAlbums.length}`, 
+      `Completed album page processing for batch ${batchId}. Processed: ${processedAlbums.length}, Failed: ${failedAlbums.length}${nextPageScheduled ? ', scheduled next page' : ''}`, 
       { 
         batchId, 
         processed: processedAlbums.length, 
         failed: failedAlbums.length,
         processingTimeMs,
         successRate,
+        isFinal,
+        nextPageScheduled,
         traceId 
       },
       traceId
@@ -259,11 +345,12 @@ async function processAlbumPage(request: AlbumPageRequest): Promise<{
     
     return {
       success: true,
-      message: `Processed ${processedAlbums.length} albums, failed ${failedAlbums.length} albums`,
+      message: `Processed ${processedAlbums.length} albums, failed ${failedAlbums.length} albums${nextPageScheduled ? ', scheduled next page' : ''}`,
       batchId,
       processed: processedAlbums.length,
       failed: failedAlbums.length,
-      status: 'completed'
+      status: batchStatus.status,
+      nextPageScheduled
     };
     
   } catch (error) {
@@ -453,6 +540,196 @@ async function processAlbum(
   }
 }
 
+// Check if all album pages for an artist are completed and update parent batch
+async function updateParentArtistBatch(
+  parentBatchId: string,
+  artistId: string,
+  traceId: string
+): Promise<void> {
+  try {
+    // Get all album page batches for this artist
+    const { data: albumBatches, error: batchError } = await supabase
+      .from('processing_batches')
+      .select('id, status, metadata')
+      .eq('batch_type', 'process_album_page')
+      .eq('metadata->parent_batch_id', parentBatchId)
+      .eq('metadata->artist_id', artistId);
+    
+    if (batchError) {
+      throw new Error(`Error checking album batches: ${batchError.message}`);
+    }
+
+    if (!albumBatches || albumBatches.length === 0) {
+      await logSystemEvent('warning', 'update_parent_artist_batch',
+        `No album page batches found for artist ${artistId}`,
+        { parentBatchId, artistId, traceId },
+        traceId
+      );
+      return;
+    }
+
+    // Check if all album pages are completed
+    const allCompleted = albumBatches.every(batch => 
+      batch.status === 'completed' || batch.status === 'completed_with_next' || batch.status === 'error'
+    );
+
+    // Check if we have at least one final page
+    const hasFinalPage = albumBatches.some(batch => 
+      batch.metadata?.is_final_page === true
+    );
+
+    if (allCompleted && hasFinalPage) {
+      await logSystemEvent('info', 'update_parent_artist_batch',
+        `All album pages completed for artist ${artistId}`,
+        { parentBatchId, artistId, batchCount: albumBatches.length, traceId },
+        traceId
+      );
+      
+      // Create a new batch for track processing for this artist's albums
+      await createTrackPageBatches(parentBatchId, artistId, traceId);
+    }
+  } catch (error) {
+    await logSystemEvent('error', 'update_parent_artist_batch',
+      `Error updating parent artist batch: ${error.message}`,
+      { parentBatchId, artistId, stack: error.stack, traceId },
+      traceId
+    );
+  }
+}
+
+// Create track page batches for each album of an artist
+async function createTrackPageBatches(
+  parentArtistBatchId: string,
+  artistId: string,
+  traceId: string
+): Promise<void> {
+  try {
+    // Get all primary albums for this artist
+    const { data: albums, error: albumsError } = await supabase
+      .from('albums')
+      .select('id, name, spotify_id, total_tracks')
+      .eq('artist_id', artistId)
+      .eq('is_primary_artist_album', true);
+    
+    if (albumsError) {
+      throw new Error(`Error fetching albums: ${albumsError.message}`);
+    }
+
+    if (!albums || albums.length === 0) {
+      await logSystemEvent('info', 'create_track_page_batches',
+        `No albums found for artist ${artistId}`,
+        { parentArtistBatchId, artistId, traceId },
+        traceId
+      );
+      return;
+    }
+
+    await logSystemEvent('info', 'create_track_page_batches',
+      `Creating track page batches for ${albums.length} albums`,
+      { parentArtistBatchId, artistId, albumCount: albums.length, traceId },
+      traceId
+    );
+
+    // Create a parent batch for all track processing for this artist
+    const { data: trackParentBatch, error: parentBatchError } = await supabase
+      .from('processing_batches')
+      .insert({
+        batch_type: 'process_tracks',
+        status: 'pending',
+        metadata: {
+          artist_id: artistId,
+          parent_batch_id: parentArtistBatchId,
+          album_count: albums.length,
+          source: 'pipeline',
+          correlation_id: traceId
+        }
+      })
+      .select('id')
+      .single();
+
+    if (parentBatchError || !trackParentBatch) {
+      throw new Error(`Error creating parent track batch: ${parentBatchError?.message || 'No data returned'}`);
+    }
+
+    // Constants for pagination
+    const PAGE_SIZE = 50; // Tracks per page
+    
+    // Create a track page batch for each album
+    for (const album of albums) {
+      if (!album.spotify_id) {
+        continue; // Skip albums without a Spotify ID
+      }
+
+      const totalTracks = album.total_tracks || 1;
+      const pages = Math.ceil(totalTracks / PAGE_SIZE);
+
+      // Create the first page batch
+      const { data: firstPageBatch, error: firstPageError } = await supabase
+        .from('processing_batches')
+        .insert({
+          batch_type: 'process_track_page',
+          status: 'pending',
+          metadata: {
+            album_id: album.id,
+            album_name: album.name,
+            artist_id: artistId,
+            parent_album_batch_id: trackParentBatch.id,
+            offset: 0,
+            limit: PAGE_SIZE,
+            page_index: 0,
+            total_pages: pages,
+            spotify_id: album.spotify_id,
+            correlation_id: traceId
+          }
+        })
+        .select('id')
+        .single();
+
+      if (firstPageError || !firstPageBatch) {
+        await logSystemEvent('error', 'create_track_page_batches',
+          `Error creating track page batch for album ${album.name}: ${firstPageError?.message || 'No data returned'}`,
+          { albumId: album.id, albumName: album.name, traceId },
+          traceId
+        );
+        continue;
+      }
+
+      // Call the track page processing function for the first page
+      // Do this asynchronously to not block this loop
+      edgeRuntime.waitUntil(
+        supabase.functions.invoke("process-track-page", {
+          body: {
+            batchId: firstPageBatch.id,
+            albumId: album.id,
+            offset: 0,
+            limit: PAGE_SIZE,
+            correlationId: traceId,
+            parentAlbumBatchId: trackParentBatch.id
+          }
+        })
+      );
+
+      await logSystemEvent('info', 'create_track_page_batches',
+        `Created track page batch for album ${album.name}`,
+        { 
+          albumId: album.id, 
+          albumName: album.name, 
+          batchId: firstPageBatch.id,
+          totalPages: pages,
+          traceId 
+        },
+        traceId
+      );
+    }
+  } catch (error) {
+    await logSystemEvent('error', 'create_track_page_batches',
+      `Error creating track page batches: ${error.message}`,
+      { parentArtistBatchId, artistId, stack: error.stack, traceId },
+      traceId
+    );
+  }
+}
+
 // Calculate album data quality score based on completeness
 function calculateAlbumQualityScore(album: any): number {
   let score = 0.5; // Base score
@@ -506,7 +783,10 @@ serve(async (req) => {
         offset: parseInt(url.searchParams.get('offset') || '0'),
         limit: parseInt(url.searchParams.get('limit') || '20'),
         artistId: url.searchParams.get('artistId') || undefined,
-        correlationId: url.searchParams.get('correlationId') || undefined
+        correlationId: url.searchParams.get('correlationId') || undefined,
+        parentBatchId: url.searchParams.get('parentBatchId') || undefined,
+        pageIndex: parseInt(url.searchParams.get('pageIndex') || '0'),
+        totalPages: parseInt(url.searchParams.get('totalPages') || '1')
       };
     }
     
