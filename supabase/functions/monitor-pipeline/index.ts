@@ -10,7 +10,7 @@ import {
   checkBackpressure,
   trackErrorRates
 } from "../lib/pipeline-utils.ts";
-import { supabase } from "../lib/api-clients.ts";
+import { supabase, SpotifyClient } from "../lib/api-clients.ts";
 
 // CORS headers
 const corsHeaders = {
@@ -22,6 +22,7 @@ const corsHeaders = {
 // Configure alert thresholds
 const DLQ_ALERT_THRESHOLD = 100; // Alert if DLQ exceeds this size
 const ERROR_RATE_ALERT_THRESHOLD = 0.25; // 25% error rate is concerning
+const MAX_CONCURRENCY_PER_FUNCTION = 5; // Maximum concurrent executions per function
 
 interface MonitorRequest {
   checkFinalizedBatches?: boolean;
@@ -31,6 +32,7 @@ interface MonitorRequest {
   checkCircuitBreakers?: boolean;
   notifyOnCompletion?: boolean;
   specificBatchId?: string;
+  correlationId?: string;
 }
 
 async function monitorPipeline(request: MonitorRequest = {}): Promise<{
@@ -41,7 +43,7 @@ async function monitorPipeline(request: MonitorRequest = {}): Promise<{
   stuckBatches?: string[];
 }> {
   // Generate correlation ID for tracing this monitoring run
-  const correlationId = generateCorrelationId();
+  const correlationId = request.correlationId || generateCorrelationId();
   const alerts: any[] = [];
   
   try {
@@ -79,30 +81,36 @@ async function monitorPipeline(request: MonitorRequest = {}): Promise<{
       }
     }
     
+    // Check if we need to bootstrap the pipeline by discovering artists
+    await checkPipelineBootstrap(correlationId);
+    
     // Check for completed batches and trigger next stages
     let completedBatches: string[] = [];
     
     if (request.checkFinalizedBatches !== false) {
       // Either check a specific batch or find recently completed batches
       if (request.specificBatchId) {
-        const completionStatus = await checkBatchCompletion(request.specificBatchId);
-        
-        if (completionStatus.complete) {
-          completedBatches.push(request.specificBatchId);
-          
-          await handleCompletedBatch(
-            request.specificBatchId, 
-            completionStatus, 
-            correlationId
-          );
-        }
+        await checkBatchCompletion(request.specificBatchId).then(async completionStatus => {
+          if (completionStatus.complete) {
+            completedBatches.push(request.specificBatchId!);
+            
+            await handleCompletedBatch(
+              request.specificBatchId!, 
+              completionStatus, 
+              correlationId
+            );
+          }
+        });
       } else {
+        // Check batches by detecting completion signals
+        await checkForCompletionSignals(correlationId);
+        
         // Check the following types of processing batches:
         const batchTypes = [
-          'process_artists',         // Main artist batches
-          'process_albums',          // Main album dispatcher batches
-          'process_album_page',      // Page-based album processing
-          'process_track_page'       // Page-based track processing
+          'discover_artists',      // Artist discovery
+          'process_album_page',    // Page-based album processing
+          'process_track_page',    // Page-based track processing
+          'process_producers_batch' // Producer processing
         ];
         
         for (const batchType of batchTypes) {
@@ -132,9 +140,6 @@ async function monitorPipeline(request: MonitorRequest = {}): Promise<{
             }
           }
         }
-        
-        // Check if any parent batches need to be updated based on their child pages
-        await checkPagedBatchesCompletion(correlationId);
       }
     }
     
@@ -290,58 +295,258 @@ async function monitorPipeline(request: MonitorRequest = {}): Promise<{
   }
 }
 
-// Check for album and track page batches that have completed and update their parent batches
-async function checkPagedBatchesCompletion(correlationId: string): Promise<void> {
+// Check for completion signals and trigger the next stage
+async function checkForCompletionSignals(correlationId: string): Promise<void> {
   try {
-    // Check for album pages completion - once all pages for an artist are done, we need to create track page batches
-    await checkAlbumPagesCompletion(correlationId);
+    // Check for artists_completed signal
+    await checkArtistsCompletedSignal(correlationId);
     
-    // Check for track pages completion - once all pages for an album are done, we need to update parent album batch
-    await checkTrackPagesCompletion(correlationId);
+    // Check for albums_completed signal
+    await checkAlbumsCompletedSignal(correlationId);
+    
+    // Check for tracks_completed signal
+    await checkTracksCompletedSignal(correlationId);
+    
+    // Check for producers_completed signal
+    await checkProducersCompletedSignal(correlationId);
   } catch (error) {
-    await logSystemEvent('error', 'check_paged_batches_completion', 
-      `Error checking paged batches completion: ${error.message}`, 
-      { 
-        stack: error.stack,
-        correlationId 
-      },
+    await logSystemEvent('error', 'check_completion_signals', 
+      `Error checking completion signals: ${error.message}`, 
+      { correlationId, stack: error.stack },
       correlationId
     );
   }
 }
 
-// Check if all album pages for an artist have completed
-async function checkAlbumPagesCompletion(correlationId: string): Promise<void> {
+// Check for artists_completed signal
+async function checkArtistsCompletedSignal(correlationId: string): Promise<void> {
   try {
-    // Get any album page batches with final page = true that have been completed
-    const { data: finalPages, error: pagesError } = await supabase
+    // Find batches with artists_completed = true that haven't been processed yet
+    const { data: completedBatches, error } = await supabase
+      .from('processing_batches')
+      .select('id, metadata')
+      .eq('status', 'completed')
+      .eq('metadata->artists_completed', true)
+      .is('metadata->albums_dispatched', null); // Not yet dispatched albums
+    
+    if (error || !completedBatches || completedBatches.length === 0) {
+      return;
+    }
+    
+    // For each batch, dispatch album processing
+    for (const batch of completedBatches) {
+      await logSystemEvent('info', 'monitor_pipeline', 
+        `Found artists_completed signal for batch ${batch.id}`, 
+        { batchId: batch.id, correlationId },
+        correlationId
+      );
+      
+      // Process each artist in this batch
+      const { data: artistItems, error: itemsError } = await supabase
+        .from('processing_items')
+        .select('item_id')
+        .eq('batch_id', batch.id)
+        .eq('item_type', 'artist')
+        .eq('status', 'completed');
+      
+      if (itemsError || !artistItems || artistItems.length === 0) {
+        await logSystemEvent('warning', 'monitor_pipeline', 
+          `No completed artists found in batch ${batch.id}`, 
+          { batchId: batch.id, correlationId },
+          correlationId
+        );
+        continue;
+      }
+      
+      // Create album page batches for each artist
+      for (const artistItem of artistItems) {
+        // Get artist details to create album page batches
+        const { data: artist, error: artistError } = await supabase
+          .from('artists')
+          .select('id, name, spotify_id')
+          .eq('spotify_id', artistItem.item_id)
+          .single();
+        
+        if (artistError || !artist) {
+          await logSystemEvent('warning', 'monitor_pipeline', 
+            `Could not find artist with spotify_id ${artistItem.item_id}`, 
+            { artistSpotifyId: artistItem.item_id, correlationId },
+            correlationId
+          );
+          continue;
+        }
+        
+        // Start with a single album page batch - it will create more if needed
+        await createAlbumPageBatch(
+          artist.id, 
+          artist.name, 
+          artist.spotify_id, 
+          0, // Starting offset
+          20, // Page size
+          correlationId,
+          batch.id // parent batch ID
+        );
+      }
+      
+      // Mark this batch as having dispatched albums
+      await supabase
+        .from('processing_batches')
+        .update({
+          metadata: {
+            ...batch.metadata,
+            albums_dispatched: true,
+            albums_dispatched_at: new Date().toISOString()
+          }
+        })
+        .eq('id', batch.id);
+      
+      await logSystemEvent('info', 'monitor_pipeline', 
+        `Dispatched album processing for all artists in batch ${batch.id}`, 
+        { batchId: batch.id, artistCount: artistItems.length, correlationId },
+        correlationId
+      );
+    }
+  } catch (error) {
+    await logSystemEvent('error', 'check_artists_completed', 
+      `Error processing artists_completed signal: ${error.message}`, 
+      { correlationId, stack: error.stack },
+      correlationId
+    );
+  }
+}
+
+// Create an album page batch
+async function createAlbumPageBatch(
+  artistId: string,
+  artistName: string,
+  spotifyId: string,
+  offset: number,
+  limit: number,
+  correlationId: string,
+  parentBatchId?: string
+): Promise<string | null> {
+  try {
+    // Check if we're still allowed to process
+    const isAPIRateLimited = await checkCircuitBreaker('spotify');
+    if (isAPIRateLimited) {
+      await logSystemEvent('warning', 'create_album_page_batch', 
+        `Spotify API is rate limited, delaying album page batch creation for artist ${artistName}`, 
+        { artistId, spotifyId, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Check for backpressure
+    const hasBackpressure = await checkBackpressure('process_album_page', MAX_CONCURRENCY_PER_FUNCTION);
+    if (hasBackpressure) {
+      await logSystemEvent('warning', 'create_album_page_batch', 
+        `System has backpressure, delaying album page batch creation for artist ${artistName}`, 
+        { artistId, spotifyId, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Create a new album page batch
+    const { data: newBatch, error } = await supabase
+      .from('processing_batches')
+      .insert({
+        batch_type: 'process_album_page',
+        status: 'pending',
+        metadata: {
+          artist_id: artistId,
+          artist_name: artistName,
+          spotify_id: spotifyId,
+          offset,
+          limit,
+          page_index: Math.floor(offset / limit),
+          parent_batch_id: parentBatchId,
+          correlation_id: correlationId,
+          created_at: new Date().toISOString()
+        }
+      })
+      .select('id')
+      .single();
+    
+    if (error) {
+      await logSystemEvent('error', 'create_album_page_batch', 
+        `Error creating album page batch for artist ${artistName}: ${error.message}`, 
+        { artistId, spotifyId, offset, limit, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Call the process-album-page function to process this batch
+    EdgeRuntime.waitUntil(
+      supabase.functions.invoke('process-album-page', {
+        body: {
+          batchId: newBatch.id,
+          artistId,
+          artistName,
+          spotifyId,
+          offset,
+          limit,
+          correlationId
+        }
+      })
+    );
+    
+    await logSystemEvent('info', 'create_album_page_batch', 
+      `Created album page batch ${newBatch.id} for artist ${artistName} (offset: ${offset}, limit: ${limit})`, 
+      { artistId, spotifyId, batchId: newBatch.id, offset, limit, correlationId },
+      correlationId
+    );
+    
+    return newBatch.id;
+  } catch (error) {
+    await logSystemEvent('error', 'create_album_page_batch', 
+      `Error creating album page batch: ${error.message}`, 
+      { artistId, spotifyId, offset, limit, correlationId, stack: error.stack },
+      correlationId
+    );
+    return null;
+  }
+}
+
+// Check for albums_completed signal
+async function checkAlbumsCompletedSignal(correlationId: string): Promise<void> {
+  try {
+    // Find all album page batches with is_final_page = true
+    const { data: finalPages, error } = await supabase
       .from('processing_batches')
       .select('id, metadata')
       .eq('batch_type', 'process_album_page')
       .in('status', ['completed', 'completed_with_next'])
       .eq('metadata->is_final_page', true)
-      .is('metadata->processed_by_monitor', null); // Only process each one once
+      .is('metadata->tracks_dispatched', null); // Not yet dispatched tracks
     
-    if (pagesError || !finalPages || finalPages.length === 0) {
+    if (error || !finalPages || finalPages.length === 0) {
       return;
     }
     
-    // For each final page, check all pages for that artist
+    // For each final page, check all pages for that artist to see if all completed
     for (const page of finalPages) {
       const artistId = page.metadata?.artist_id;
       const parentBatchId = page.metadata?.parent_batch_id;
       
-      if (!artistId || !parentBatchId) {
+      if (!artistId) {
         continue;
       }
       
-      // Get all pages for this artist
+      await logSystemEvent('info', 'monitor_pipeline', 
+        `Found final album page for artist ${artistId}`, 
+        { artistId, finalPageId: page.id, correlationId },
+        correlationId
+      );
+      
+      // Get all pages for this artist to check if all are complete
       const { data: allPages, error: allPagesError } = await supabase
         .from('processing_batches')
-        .select('id, status, metadata')
+        .select('id, status')
         .eq('batch_type', 'process_album_page')
-        .eq('metadata->artist_id', artistId)
-        .eq('metadata->parent_batch_id', parentBatchId);
+        .eq('metadata->artist_id', artistId);
       
       if (allPagesError || !allPages || allPages.length === 0) {
         continue;
@@ -353,69 +558,281 @@ async function checkAlbumPagesCompletion(correlationId: string): Promise<void> {
       );
       
       if (allCompleted) {
-        await logSystemEvent('info', 'check_album_pages_completion',
-          `All album pages completed for artist ${artistId}`,
-          { artistId, parentBatchId, pageCount: allPages.length, correlationId },
+        await logSystemEvent('info', 'monitor_pipeline', 
+          `All album pages completed for artist ${artistId}`, 
+          { artistId, pageCount: allPages.length, correlationId },
           correlationId
         );
         
-        // Mark the final page as processed
+        // Mark all these pages as having albums completed
+        for (const albumPage of allPages) {
+          await supabase
+            .from('processing_batches')
+            .update({
+              metadata: {
+                ...page.metadata,
+                albums_completed: true,
+                albums_completed_at: new Date().toISOString(),
+                tracks_dispatched: false
+              }
+            })
+            .eq('id', albumPage.id);
+        }
+        
+        // Find all albums for this artist in our database to process tracks
+        const { data: artistAlbums, error: albumsError } = await supabase
+          .from('albums')
+          .select('id, name, spotify_id, total_tracks')
+          .eq('artist_id', artistId);
+        
+        if (albumsError || !artistAlbums || artistAlbums.length === 0) {
+          await logSystemEvent('warning', 'monitor_pipeline', 
+            `No albums found for artist ${artistId}, but all album pages are complete`, 
+            { artistId, correlationId },
+            correlationId
+          );
+          continue;
+        }
+        
+        // Create a track processing batch for this artist
+        const { data: trackBatch, error: trackBatchError } = await supabase
+          .from('processing_batches')
+          .insert({
+            batch_type: 'process_tracks',
+            status: 'pending',
+            metadata: {
+              artist_id: artistId,
+              album_count: artistAlbums.length,
+              parent_batch_id: parentBatchId,
+              correlation_id: correlationId,
+              source: 'monitor_pipeline',
+              created_at: new Date().toISOString()
+            }
+          })
+          .select('id')
+          .single();
+        
+        if (trackBatchError || !trackBatch) {
+          await logSystemEvent('error', 'monitor_pipeline', 
+            `Error creating track batch for artist ${artistId}: ${trackBatchError?.message || 'No data returned'}`, 
+            { artistId, correlationId },
+            correlationId
+          );
+          continue;
+        }
+        
+        // Update the parent batch (if any) to show albums are completed
+        if (parentBatchId) {
+          await supabase
+            .from('processing_batches')
+            .update({
+              metadata: {
+                albums_completed: true,
+                albums_completed_at: new Date().toISOString(),
+                track_batch_id: trackBatch.id
+              }
+            })
+            .eq('id', parentBatchId);
+        }
+        
+        // Create a track page batch for each album
+        for (const album of artistAlbums) {
+          if (!album.spotify_id) continue;
+          
+          // Create the first track page batch for this album - it will create more if needed
+          await createTrackPageBatch(
+            album.id,
+            album.name,
+            album.spotify_id,
+            0, // Starting offset
+            50, // Page size
+            trackBatch.id,
+            artistId,
+            correlationId
+          );
+        }
+        
+        // Mark the final page as tracks dispatched
         await supabase
           .from('processing_batches')
           .update({
             metadata: {
               ...page.metadata,
-              processed_by_monitor: true,
-              processed_at: new Date().toISOString()
+              tracks_dispatched: true,
+              tracks_dispatched_at: new Date().toISOString()
             }
           })
           .eq('id', page.id);
         
-        // Create track page batches for all albums
-        await createTrackPageBatches(parentBatchId, artistId, correlationId);
+        await logSystemEvent('info', 'monitor_pipeline', 
+          `Dispatched track processing for all albums of artist ${artistId}`, 
+          { artistId, albumCount: artistAlbums.length, correlationId },
+          correlationId
+        );
       }
     }
   } catch (error) {
-    await logSystemEvent('error', 'check_album_pages_completion', 
-      `Error checking album pages completion: ${error.message}`, 
-      { stack: error.stack, correlationId },
+    await logSystemEvent('error', 'check_albums_completed', 
+      `Error processing albums_completed signal: ${error.message}`, 
+      { correlationId, stack: error.stack },
       correlationId
     );
   }
 }
 
-// Check if all track pages for an album have completed
-async function checkTrackPagesCompletion(correlationId: string): Promise<void> {
+// Create a track page batch
+async function createTrackPageBatch(
+  albumId: string,
+  albumName: string,
+  spotifyId: string,
+  offset: number,
+  limit: number,
+  parentAlbumBatchId: string,
+  artistId: string,
+  correlationId: string
+): Promise<string | null> {
   try {
-    // Get any track page batches with final page = true that have been completed
-    const { data: finalPages, error: pagesError } = await supabase
+    // Check if the API is rate limited
+    const isAPIRateLimited = await checkCircuitBreaker('spotify');
+    if (isAPIRateLimited) {
+      await logSystemEvent('warning', 'create_track_page_batch', 
+        `Spotify API is rate limited, delaying track page batch creation for album ${albumName}`, 
+        { albumId, spotifyId, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Check for backpressure
+    const hasBackpressure = await checkBackpressure('process_track_page', MAX_CONCURRENCY_PER_FUNCTION);
+    if (hasBackpressure) {
+      await logSystemEvent('warning', 'create_track_page_batch', 
+        `System has backpressure, delaying track page batch creation for album ${albumName}`, 
+        { albumId, spotifyId, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Create a new track page batch
+    const { data: newBatch, error } = await supabase
+      .from('processing_batches')
+      .insert({
+        batch_type: 'process_track_page',
+        status: 'pending',
+        metadata: {
+          album_id: albumId,
+          album_name: albumName,
+          spotify_id: spotifyId,
+          artist_id: artistId,
+          offset,
+          limit,
+          page_index: Math.floor(offset / limit),
+          parent_album_batch_id: parentAlbumBatchId,
+          correlation_id: correlationId,
+          created_at: new Date().toISOString()
+        }
+      })
+      .select('id')
+      .single();
+    
+    if (error) {
+      await logSystemEvent('error', 'create_track_page_batch', 
+        `Error creating track page batch for album ${albumName}: ${error.message}`, 
+        { albumId, spotifyId, offset, limit, correlationId },
+        correlationId
+      );
+      return null;
+    }
+    
+    // Add this album to the parent batch as an item to track
+    await supabase
+      .from('processing_items')
+      .insert({
+        batch_id: parentAlbumBatchId,
+        item_type: 'album',
+        item_id: albumId,
+        status: 'pending',
+        priority: 5,
+        metadata: {
+          album_name: albumName,
+          spotify_id: spotifyId,
+          offset,
+          limit,
+          correlation_id: correlationId
+        }
+      });
+    
+    // Call the process-track-page function to process this batch
+    EdgeRuntime.waitUntil(
+      supabase.functions.invoke('process-track-page', {
+        body: {
+          batchId: newBatch.id,
+          albumId,
+          albumName,
+          spotifyId,
+          offset,
+          limit,
+          correlationId,
+          parentAlbumBatchId
+        }
+      })
+    );
+    
+    await logSystemEvent('info', 'create_track_page_batch', 
+      `Created track page batch ${newBatch.id} for album ${albumName} (offset: ${offset}, limit: ${limit})`, 
+      { albumId, spotifyId, batchId: newBatch.id, offset, limit, correlationId },
+      correlationId
+    );
+    
+    return newBatch.id;
+  } catch (error) {
+    await logSystemEvent('error', 'create_track_page_batch', 
+      `Error creating track page batch: ${error.message}`, 
+      { albumId, spotifyId, offset, limit, correlationId, stack: error.stack },
+      correlationId
+    );
+    return null;
+  }
+}
+
+// Check for tracks_completed signal
+async function checkTracksCompletedSignal(correlationId: string): Promise<void> {
+  try {
+    // Find all track page batches with is_final_page = true
+    const { data: finalPages, error } = await supabase
       .from('processing_batches')
       .select('id, metadata')
       .eq('batch_type', 'process_track_page')
       .in('status', ['completed', 'completed_with_next'])
       .eq('metadata->is_final_page', true)
-      .is('metadata->processed_by_monitor', null); // Only process each one once
+      .is('metadata->producers_dispatched', null); // Not yet dispatched producers
     
-    if (pagesError || !finalPages || finalPages.length === 0) {
+    if (error || !finalPages || finalPages.length === 0) {
       return;
     }
     
-    // For each final page, check all pages for that album
+    // For each final page, check all pages for that album to see if all completed
     for (const page of finalPages) {
       const albumId = page.metadata?.album_id;
-      const parentBatchId = page.metadata?.parent_album_batch_id;
+      const parentAlbumBatchId = page.metadata?.parent_album_batch_id;
       
-      if (!albumId || !parentBatchId) {
+      if (!albumId || !parentAlbumBatchId) {
         continue;
       }
       
-      // Get all pages for this album
+      await logSystemEvent('info', 'monitor_pipeline', 
+        `Found final track page for album ${albumId}`, 
+        { albumId, finalPageId: page.id, correlationId },
+        correlationId
+      );
+      
+      // Get all pages for this album to check if all are complete
       const { data: allPages, error: allPagesError } = await supabase
         .from('processing_batches')
-        .select('id, status, metadata')
+        .select('id, status')
         .eq('batch_type', 'process_track_page')
-        .eq('metadata->album_id', albumId)
-        .eq('metadata->parent_album_batch_id', parentBatchId);
+        .eq('metadata->album_id', albumId);
       
       if (allPagesError || !allPages || allPages.length === 0) {
         continue;
@@ -427,289 +844,447 @@ async function checkTrackPagesCompletion(correlationId: string): Promise<void> {
       );
       
       if (allCompleted) {
-        await logSystemEvent('info', 'check_track_pages_completion',
-          `All track pages completed for album ${albumId}`,
-          { albumId, parentBatchId, pageCount: allPages.length, correlationId },
+        await logSystemEvent('info', 'monitor_pipeline', 
+          `All track pages completed for album ${albumId}`, 
+          { albumId, pageCount: allPages.length, correlationId },
           correlationId
         );
         
-        // Mark the final page as processed
+        // Mark all these pages as having tracks completed
+        for (const trackPage of allPages) {
+          await supabase
+            .from('processing_batches')
+            .update({
+              metadata: {
+                ...trackPage.metadata,
+                tracks_completed: true,
+                tracks_completed_at: new Date().toISOString()
+              }
+            })
+            .eq('id', trackPage.id);
+        }
+        
+        // Update the album item in parent batch as completed
+        const { data: albumItems, error: itemsError } = await supabase
+          .from('processing_items')
+          .select('id')
+          .eq('batch_id', parentAlbumBatchId)
+          .eq('item_id', albumId)
+          .eq('item_type', 'album');
+        
+        if (!itemsError && albumItems && albumItems.length > 0) {
+          await supabase
+            .from('processing_items')
+            .update({
+              status: 'completed',
+              updated_at: new Date().toISOString(),
+              metadata: {
+                tracks_completed_at: new Date().toISOString(),
+                tracks_correlation_id: correlationId
+              }
+            })
+            .eq('id', albumItems[0].id);
+        }
+        
+        // Check if all albums in the parent batch are now completed
+        const { data: allItems, error: allItemsError } = await supabase
+          .from('processing_items')
+          .select('id, status')
+          .eq('batch_id', parentAlbumBatchId);
+        
+        if (!allItemsError && allItems && allItems.length > 0) {
+          const allItemsCompleted = allItems.every(item => 
+            item.status === 'completed' || item.status === 'error'
+          );
+          
+          if (allItemsCompleted) {
+            // All albums have completed tracks processing
+            await supabase
+              .from('processing_batches')
+              .update({
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                metadata: {
+                  tracks_completed: true,
+                  tracks_completed_at: new Date().toISOString(),
+                  tracks_correlation_id: correlationId
+                }
+              })
+              .eq('id', parentAlbumBatchId);
+            
+            // Trigger producers processing
+            await dispatchProducerProcessing(parentAlbumBatchId, correlationId);
+            
+            await logSystemEvent('info', 'monitor_pipeline', 
+              `All tracks for all albums in batch ${parentAlbumBatchId} completed. Dispatching producers processing.`, 
+              { parentAlbumBatchId, correlationId },
+              correlationId
+            );
+          }
+        }
+        
+        // Mark the final page as producers dispatched
         await supabase
           .from('processing_batches')
           .update({
             metadata: {
               ...page.metadata,
-              processed_by_monitor: true,
-              processed_at: new Date().toISOString()
+              producers_dispatched: true,
+              producers_dispatched_at: new Date().toISOString()
             }
           })
           .eq('id', page.id);
-        
-        // Update album completion status in parent batch
-        await updateAlbumCompletionStatus(parentBatchId, albumId, correlationId);
       }
     }
   } catch (error) {
-    await logSystemEvent('error', 'check_track_pages_completion', 
-      `Error checking track pages completion: ${error.message}`, 
-      { stack: error.stack, correlationId },
+    await logSystemEvent('error', 'check_tracks_completed', 
+      `Error processing tracks_completed signal: ${error.message}`, 
+      { correlationId, stack: error.stack },
       correlationId
     );
   }
 }
 
-// Create track page batches for each album of an artist
-async function createTrackPageBatches(
-  parentArtistBatchId: string,
-  artistId: string,
-  correlationId: string
-): Promise<void> {
+// Dispatch producer processing
+async function dispatchProducerProcessing(parentTrackBatchId: string, correlationId: string): Promise<void> {
   try {
-    // Get all primary albums for this artist
-    const { data: albums, error: albumsError } = await supabase
-      .from('albums')
-      .select('id, name, spotify_id, total_tracks')
-      .eq('artist_id', artistId)
-      .eq('is_primary_artist_album', true);
+    // Get the batch info
+    const { data: parentBatch, error: batchError } = await supabase
+      .from('processing_batches')
+      .select('metadata')
+      .eq('id', parentTrackBatchId)
+      .single();
     
-    if (albumsError) {
-      throw new Error(`Error fetching albums: ${albumsError.message}`);
-    }
-
-    if (!albums || albums.length === 0) {
-      await logSystemEvent('info', 'create_track_page_batches',
-        `No albums found for artist ${artistId}`,
-        { parentArtistBatchId, artistId, correlationId },
+    if (batchError || !parentBatch) {
+      await logSystemEvent('error', 'dispatch_producer_processing', 
+        `Error getting parent batch ${parentTrackBatchId}: ${batchError?.message || 'No data returned'}`, 
+        { parentTrackBatchId, correlationId },
         correlationId
       );
       return;
     }
-
-    await logSystemEvent('info', 'create_track_page_batches',
-      `Creating track page batches for ${albums.length} albums`,
-      { parentArtistBatchId, artistId, albumCount: albums.length, correlationId },
-      correlationId
-    );
-
-    // Create a parent batch for all track processing for this artist
-    const { data: trackParentBatch, error: parentBatchError } = await supabase
+    
+    // Create a producer processing batch
+    const { data: producerBatch, error: producerBatchError } = await supabase
       .from('processing_batches')
       .insert({
-        batch_type: 'process_tracks',
+        batch_type: 'process_producers_batch',
         status: 'pending',
         metadata: {
-          artist_id: artistId,
-          parent_batch_id: parentArtistBatchId,
-          album_count: albums.length,
+          parent_batch_id: parentTrackBatchId,
+          artist_id: parentBatch.metadata?.artist_id,
+          correlation_id: correlationId,
           source: 'monitor_pipeline',
-          correlation_id: correlationId
+          created_at: new Date().toISOString()
         }
       })
       .select('id')
       .single();
-
-    if (parentBatchError || !trackParentBatch) {
-      throw new Error(`Error creating parent track batch: ${parentBatchError?.message || 'No data returned'}`);
-    }
-
-    // Constants for pagination
-    const PAGE_SIZE = 50; // Tracks per page
     
-    // Create a track page batch for each album
-    for (const album of albums) {
-      if (!album.spotify_id) {
-        continue; // Skip albums without a Spotify ID
-      }
-
-      const totalTracks = album.total_tracks || 1;
-      const pages = Math.ceil(totalTracks / PAGE_SIZE);
-
-      // Create the first page batch
-      const { data: firstPageBatch, error: firstPageError } = await supabase
-        .from('processing_batches')
-        .insert({
-          batch_type: 'process_track_page',
-          status: 'pending',
-          metadata: {
-            album_id: album.id,
-            album_name: album.name,
-            artist_id: artistId,
-            parent_album_batch_id: trackParentBatch.id,
-            offset: 0,
-            limit: PAGE_SIZE,
-            page_index: 0,
-            total_pages: pages,
-            spotify_id: album.spotify_id,
-            correlation_id: correlationId
-          }
-        })
-        .select('id')
-        .single();
-
-      if (firstPageError || !firstPageBatch) {
-        await logSystemEvent('error', 'create_track_page_batches',
-          `Error creating track page batch for album ${album.name}: ${firstPageError?.message || 'No data returned'}`,
-          { albumId: album.id, albumName: album.name, correlationId },
-          correlationId
-        );
-        continue;
-      }
-
-      // Create an album item in the parent batch
-      await supabase
-        .from('processing_items')
-        .insert({
-          batch_id: trackParentBatch.id,
-          item_type: 'album_for_tracks',
-          item_id: album.id,
-          status: 'pending',
-          priority: 5,
-          metadata: {
-            album_name: album.name,
-            artist_id: artistId,
-            total_tracks: totalTracks,
-            total_pages: pages,
-            correlation_id: correlationId
-          }
-        });
-
-      // Call the track page processing function for the first page
-      // Do this asynchronously to not block this loop
-      edgeRuntime.waitUntil(
-        supabase.functions.invoke("process-track-page", {
-          body: {
-            batchId: firstPageBatch.id,
-            albumId: album.id,
-            offset: 0,
-            limit: PAGE_SIZE,
-            correlationId,
-            parentAlbumBatchId: trackParentBatch.id
-          }
-        })
-      );
-
-      await logSystemEvent('info', 'create_track_page_batches',
-        `Created track page batch for album ${album.name}`,
-        { 
-          albumId: album.id, 
-          albumName: album.name, 
-          batchId: firstPageBatch.id,
-          totalPages: pages,
-          correlationId 
-        },
+    if (producerBatchError || !producerBatch) {
+      await logSystemEvent('error', 'dispatch_producer_processing', 
+        `Error creating producer batch: ${producerBatchError?.message || 'No data returned'}`, 
+        { parentTrackBatchId, correlationId },
         correlationId
       );
+      return;
     }
-
-    // Update the parent artist batch as completed
+    
+    // Find all tracks for this artist to process producers
+    const { data: tracks, error: tracksError } = await supabase
+      .from('tracks')
+      .select('id, name, spotify_id')
+      .eq('artist_id', parentBatch.metadata?.artist_id);
+    
+    if (tracksError || !tracks || tracks.length === 0) {
+      await logSystemEvent('warning', 'dispatch_producer_processing', 
+        `No tracks found for artist ${parentBatch.metadata?.artist_id}`, 
+        { artistId: parentBatch.metadata?.artist_id, correlationId },
+        correlationId
+      );
+      return;
+    }
+    
+    // Add each track as an item to process
+    const trackItems = tracks.map(track => ({
+      batch_id: producerBatch.id,
+      item_type: 'track',
+      item_id: track.id,
+      status: 'pending',
+      priority: 5,
+      metadata: {
+        track_name: track.name,
+        spotify_id: track.spotify_id,
+        correlation_id: correlationId
+      }
+    }));
+    
+    // Insert in chunks to avoid exceeding payload limits
+    const chunkSize = 100;
+    for (let i = 0; i < trackItems.length; i += chunkSize) {
+      const chunk = trackItems.slice(i, i + chunkSize);
+      
+      const { error: insertError } = await supabase
+        .from('processing_items')
+        .insert(chunk);
+      
+      if (insertError) {
+        await logSystemEvent('error', 'dispatch_producer_processing', 
+          `Error adding tracks to producer batch: ${insertError.message}`, 
+          { batchId: producerBatch.id, chunkIndex: i, chunkSize, correlationId },
+          correlationId
+        );
+      }
+    }
+    
+    // Update the batch with the accurate count
     await supabase
       .from('processing_batches')
       .update({
-        status: 'completed',
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        metadata: {
-          albums_completed: true,
-          tracks_batch_id: trackParentBatch.id,
-          albums_completed_at: new Date().toISOString(),
-          correlation_id: correlationId
+        items_total: tracks.length,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', producerBatch.id);
+    
+    // Call the producer processing function
+    EdgeRuntime.waitUntil(
+      supabase.functions.invoke('process-producers-batch', {
+        body: {
+          batchId: producerBatch.id,
+          correlationId
         }
       })
-      .eq('id', parentArtistBatchId);
-
-    await incrementMetric('track_page_batches_created', albums.length, {
-      parent_batch_id: parentArtistBatchId,
-      track_parent_batch_id: trackParentBatch.id
-    });
+    );
+    
+    await logSystemEvent('info', 'dispatch_producer_processing', 
+      `Dispatched producer processing for ${tracks.length} tracks`, 
+      { batchId: producerBatch.id, trackCount: tracks.length, correlationId },
+      correlationId
+    );
+    
+    // Update the parent batch to link to the producer batch
+    await supabase
+      .from('processing_batches')
+      .update({
+        metadata: {
+          ...parentBatch.metadata,
+          producer_batch_id: producerBatch.id,
+          producers_dispatched: true,
+          producers_dispatched_at: new Date().toISOString()
+        }
+      })
+      .eq('id', parentTrackBatchId);
   } catch (error) {
-    await logSystemEvent('error', 'create_track_page_batches',
-      `Error creating track page batches: ${error.message}`,
-      { parentArtistBatchId, artistId, stack: error.stack, correlationId },
+    await logSystemEvent('error', 'dispatch_producer_processing', 
+      `Error dispatching producer processing: ${error.message}`, 
+      { parentTrackBatchId, correlationId, stack: error.stack },
       correlationId
     );
   }
 }
 
-// Update the album completion status in parent batch
-async function updateAlbumCompletionStatus(
-  parentBatchId: string,
-  albumId: string,
-  correlationId: string
-): Promise<void> {
+// Check for producers_completed signal - this completes the entire pipeline
+async function checkProducersCompletedSignal(correlationId: string): Promise<void> {
   try {
-    // Update the album item in parent batch as completed
-    const { data: albumItems, error: itemsError } = await supabase
-      .from('processing_items')
-      .select('id')
-      .eq('batch_id', parentBatchId)
-      .eq('item_id', albumId)
-      .eq('item_type', 'album_for_tracks');
+    // Find all producer batches that are completed
+    const { data: completedBatches, error } = await supabase
+      .from('processing_batches')
+      .select('id, metadata')
+      .eq('batch_type', 'process_producers_batch')
+      .eq('status', 'completed')
+      .is('metadata->pipeline_completed', null); // Not yet marked as pipeline completed
     
-    if (itemsError || !albumItems || albumItems.length === 0) {
-      await logSystemEvent('warning', 'update_album_completion_status',
-        `No album item found for album ${albumId} in batch ${parentBatchId}`,
-        { parentBatchId, albumId, correlationId },
+    if (error || !completedBatches || completedBatches.length === 0) {
+      return;
+    }
+    
+    // For each completed producer batch, mark the entire pipeline as complete
+    for (const batch of completedBatches) {
+      const parentBatchId = batch.metadata?.parent_batch_id;
+      
+      if (!parentBatchId) {
+        continue;
+      }
+      
+      await logSystemEvent('info', 'monitor_pipeline', 
+        `Producer processing completed for batch ${batch.id}`, 
+        { batchId: batch.id, parentBatchId, correlationId },
         correlationId
       );
-      return;
-    }
-    
-    await supabase
-      .from('processing_items')
-      .update({
-        status: 'completed',
-        updated_at: new Date().toISOString(),
-        metadata: {
-          tracks_completed_at: new Date().toISOString(),
-          tracks_correlation_id: correlationId
-        }
-      })
-      .eq('id', albumItems[0].id);
-    
-    // Check if all albums in the batch are now completed
-    const { data: allItems, error: allItemsError } = await supabase
-      .from('processing_items')
-      .select('id, status')
-      .eq('batch_id', parentBatchId);
-    
-    if (allItemsError || !allItems || allItems.length === 0) {
-      return;
-    }
-    
-    const allItemsCompleted = allItems.every(item => 
-      item.status === 'completed' || item.status === 'error'
-    );
-    
-    if (allItemsCompleted) {
-      // All albums are completed, mark the parent batch as completed
+      
+      // Mark this batch as pipeline completed
       await supabase
         .from('processing_batches')
         .update({
-          status: 'tracks_completed',
-          completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
           metadata: {
-            tracks_completed_at: new Date().toISOString(),
-            tracks_correlation_id: correlationId
+            ...batch.metadata,
+            pipeline_completed: true,
+            pipeline_completed_at: new Date().toISOString()
           }
         })
-        .eq('id', parentBatchId);
+        .eq('id', batch.id);
       
-      await logSystemEvent('info', 'update_album_completion_status',
-        `Marked parent batch ${parentBatchId} as tracks_completed`,
-        { parentBatchId, correlationId },
-        correlationId
-      );
+      // Find the original artist batch by tracing back through parents
+      let currentBatchId = parentBatchId;
+      let originalBatchId = null;
+      let originalBatchType = null;
+      let notifyOnCompletion = false;
       
-      await incrementMetric('track_batches_completed', 1, {
-        parent_batch_id: parentBatchId,
-        album_count: allItems.length
-      });
+      while (currentBatchId) {
+        const { data: currentBatch, error: batchError } = await supabase
+          .from('processing_batches')
+          .select('metadata, batch_type')
+          .eq('id', currentBatchId)
+          .single();
+        
+        if (batchError || !currentBatch) {
+          break;
+        }
+        
+        // If this batch type is discovery or initial, this is the original
+        if (currentBatch.batch_type === 'discover_artists') {
+          originalBatchId = currentBatchId;
+          originalBatchType = currentBatch.batch_type;
+          notifyOnCompletion = currentBatch.metadata?.notifyOnCompletion || false;
+          break;
+        }
+        
+        // Check for parent batch ID in metadata
+        currentBatchId = currentBatch.metadata?.parent_batch_id;
+      }
+      
+      // If we found the original batch, mark it as pipeline completed
+      if (originalBatchId) {
+        await supabase
+          .from('processing_batches')
+          .update({
+            metadata: {
+              pipeline_completed: true,
+              pipeline_completed_at: new Date().toISOString(),
+              final_producer_batch_id: batch.id
+            },
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', originalBatchId);
+        
+        await logSystemEvent('info', 'monitor_pipeline', 
+          `Marked original ${originalBatchType} batch ${originalBatchId} as pipeline completed`, 
+          { originalBatchId, originalBatchType, producerBatchId: batch.id, correlationId },
+          correlationId
+        );
+        
+        // Increment a metric for the complete pipeline
+        await incrementMetric('pipeline_completed', 1, {
+          original_batch_type: originalBatchType,
+          original_batch_id: originalBatchId
+        });
+        
+        // If this batch should notify on completion (e.g., from client request)
+        if (notifyOnCompletion) {
+          // TODO: Implement notification logic if needed
+          await logSystemEvent('info', 'monitor_pipeline', 
+            `Notification requested for completed pipeline starting with batch ${originalBatchId}`, 
+            { originalBatchId, correlationId },
+            correlationId
+          );
+        }
+      }
     }
   } catch (error) {
-    await logSystemEvent('error', 'update_album_completion_status',
-      `Error updating album completion status: ${error.message}`,
-      { parentBatchId, albumId, stack: error.stack, correlationId },
+    await logSystemEvent('error', 'check_producers_completed', 
+      `Error processing producers_completed signal: ${error.message}`, 
+      { correlationId, stack: error.stack },
+      correlationId
+    );
+  }
+}
+
+// Check if we need to bootstrap the pipeline
+async function checkPipelineBootstrap(correlationId: string): Promise<void> {
+  try {
+    // Check if there are any active discover_artists batches
+    const { count: activeDiscoveryCount, error: countError } = await supabase
+      .from('processing_batches')
+      .select('*', { count: 'exact', head: true })
+      .eq('batch_type', 'discover_artists')
+      .in('status', ['pending', 'processing']);
+    
+    // If there are active discovery batches, no need to bootstrap
+    if (countError || (activeDiscoveryCount && activeDiscoveryCount > 0)) {
+      return;
+    }
+    
+    // Check if we have any active batches at all
+    const { count: totalActiveBatches, error: totalError } = await supabase
+      .from('processing_batches')
+      .select('*', { count: 'exact', head: true })
+      .in('status', ['pending', 'processing']);
+    
+    // If there are any active batches, don't bootstrap yet
+    if (totalError || (totalActiveBatches && totalActiveBatches > 0)) {
+      return;
+    }
+    
+    // Check when the last discovery batch was created
+    const { data: lastDiscovery, error: lastError } = await supabase
+      .from('processing_batches')
+      .select('created_at')
+      .eq('batch_type', 'discover_artists')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+    
+    // If we've discovered in the last day, don't auto-discover again
+    if (!lastError && lastDiscovery) {
+      const lastDiscoveryDate = new Date(lastDiscovery.created_at);
+      const dayAgo = new Date();
+      dayAgo.setDate(dayAgo.getDate() - 1);
+      
+      if (lastDiscoveryDate > dayAgo) {
+        return;
+      }
+    }
+    
+    await logSystemEvent('info', 'monitor_pipeline', 
+      'No active pipelines found, bootstrapping with artist discovery', 
+      { correlationId },
+      correlationId
+    );
+    
+    // Check if the system can handle a new discovery cycle
+    const isAPIRateLimited = await checkCircuitBreaker('spotify');
+    if (isAPIRateLimited) {
+      await logSystemEvent('warning', 'bootstrap_pipeline', 
+        'Cannot bootstrap pipeline - Spotify API is rate limited', 
+        { correlationId },
+        correlationId
+      );
+      return;
+    }
+    
+    // Bootstrap by calling discover-artists
+    EdgeRuntime.waitUntil(
+      supabase.functions.invoke('discover-artists', {
+        body: {
+          genres: ['pop', 'rock', 'hip hop', 'electronic', 'r&b', 'indie', 'dance'],
+          limit: 50,
+          minPopularity: 50,
+          maxArtistsPerGenre: 10,
+          correlationId
+        }
+      })
+    );
+    
+    await logSystemEvent('info', 'bootstrap_pipeline', 
+      'Bootstrapped pipeline with new artist discovery batch', 
+      { correlationId },
+      correlationId
+    );
+  } catch (error) {
+    await logSystemEvent('error', 'bootstrap_pipeline', 
+      `Error bootstrapping pipeline: ${error.message}`, 
+      { correlationId, stack: error.stack },
       correlationId
     );
   }
@@ -745,40 +1320,63 @@ async function handleCompletedBatch(
     
     // Handle different batch types
     switch (batch.batch_type) {
-      case 'process_artists':
-        // An artist batch is complete, trigger the album page batches
-        await handleCompletedArtistBatch(batch, completionStatus, correlationId);
-        break;
-        
-      case 'process_albums':
-        // The album dispatcher has created all necessary album page batches
-        await logSystemEvent('info', 'handle_completed_batch', 
-          `Album dispatcher batch ${batchId} has completed`, 
-          { batchId, correlationId },
-          correlationId
-        );
+      case 'discover_artists':
+        // An artist batch is complete, check if it has the artists_completed flag
+        if (batch.metadata?.artists_completed) {
+          await logSystemEvent('info', 'handle_completed_batch', 
+            `Artist discovery batch ${batchId} has completed with artists_completed flag`, 
+            { batchId, correlationId },
+            correlationId
+          );
+        }
         break;
         
       case 'process_album_page':
-        // A single album page has completed, monitor-pipeline handles orchestration
-        await logSystemEvent('info', 'handle_completed_batch', 
-          `Album page batch ${batchId} has completed`, 
-          { batchId, correlationId },
-          correlationId
-        );
+        // Check if this is the last page in a sequence
+        if (batch.status === 'completed' && batch.metadata?.is_final_page) {
+          await logSystemEvent('info', 'handle_completed_batch', 
+            `Album page batch ${batchId} has completed as final page`, 
+            { batchId, correlationId },
+            correlationId
+          );
+        } else if (batch.status === 'completed_with_next') {
+          // This has already scheduled the next page
+          await logSystemEvent('info', 'handle_completed_batch', 
+            `Album page batch ${batchId} has completed with next page scheduled`, 
+            { batchId, correlationId },
+            correlationId
+          );
+        }
         break;
         
       case 'process_track_page':
-        // A single track page has completed, monitor-pipeline handles orchestration
+        // Check if this is the last page in a sequence
+        if (batch.status === 'completed' && batch.metadata?.is_final_page) {
+          await logSystemEvent('info', 'handle_completed_batch', 
+            `Track page batch ${batchId} has completed as final page`, 
+            { batchId, correlationId },
+            correlationId
+          );
+        } else if (batch.status === 'completed_with_next') {
+          // This has already scheduled the next page
+          await logSystemEvent('info', 'handle_completed_batch', 
+            `Track page batch ${batchId} has completed with next page scheduled`, 
+            { batchId, correlationId },
+            correlationId
+          );
+        }
+        break;
+        
+      case 'process_producers_batch':
         await logSystemEvent('info', 'handle_completed_batch', 
-          `Track page batch ${batchId} has completed`, 
+          `Producer batch ${batchId} has completed`, 
           { batchId, correlationId },
           correlationId
         );
         break;
         
       default:
-        // Log that we don't have a handler for this batch type
+        // Log that we don't have a specific handler for this batch type
         await logSystemEvent('info', 'handle_completed_batch', 
           `No specific handler for batch type: ${batch.batch_type}`, 
           { batchId, batchType: batch.batch_type, correlationId },
@@ -787,13 +1385,16 @@ async function handleCompletedBatch(
     }
     
     // Mark batch as completed if not already
-    if (batch.status !== 'completed' && batch.status !== 'completed_with_next' && batch.status !== 'tracks_completed') {
+    if (batch.status !== 'completed' && batch.status !== 'completed_with_next') {
       await supabase
         .from('processing_batches')
         .update({
           status: completionStatus.failed === 0 ? 'completed' : 'partial',
           completed_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
+          updated_at: new Date().toISOString(),
+          items_total: completionStatus.total,
+          items_processed: completionStatus.completed,
+          items_failed: completionStatus.failed
         })
         .eq('id', batchId);
       
@@ -816,138 +1417,6 @@ async function handleCompletedBatch(
     await logSystemEvent('error', 'handle_completed_batch', 
       `Error handling completed batch ${batchId}: ${error.message}`, 
       { batchId, stack: error.stack, correlationId },
-      correlationId
-    );
-  }
-}
-
-// Handle completed artist batch - trigger album page processing
-async function handleCompletedArtistBatch(
-  batch: any,
-  completionStatus: { 
-    complete: boolean; 
-    total: number; 
-    completed: number; 
-    failed: number 
-  },
-  correlationId: string
-): Promise<void> {
-  try {
-    // Find all the artists that were processed successfully
-    const { data: processedArtists, error: artistsError } = await supabase
-      .from('processing_items')
-      .select('item_id, item_type')
-      .eq('batch_id', batch.id)
-      .eq('status', 'completed')
-      .eq('item_type', 'artist');
-    
-    if (artistsError || !processedArtists || processedArtists.length === 0) {
-      await logSystemEvent('warning', 'handle_artist_batch', 
-        `No successfully processed artists found in batch ${batch.id}`, 
-        { batchId: batch.id, error: artistsError?.message, correlationId },
-        correlationId
-      );
-      return;
-    }
-    
-    // For each artist, trigger album page processing
-    for (const artist of processedArtists) {
-      // Get artist details
-      const { data: artistData, error: artistError } = await supabase
-        .from('artists')
-        .select('id, name, spotify_id')
-        .eq('id', artist.item_id)
-        .single();
-      
-      if (artistError || !artistData) {
-        await logSystemEvent('warning', 'handle_artist_batch', 
-          `Could not find artist ${artist.item_id}`, 
-          { artistId: artist.item_id, error: artistError?.message, correlationId },
-          correlationId
-        );
-        continue;
-      }
-      
-      // Create a new album dispatcher batch for this artist
-      const { data: albumBatch, error: batchError } = await supabase
-        .from('processing_batches')
-        .insert({
-          batch_type: 'process_albums',
-          status: 'pending',
-          metadata: {
-            artist_id: artistData.id,
-            artist_name: artistData.name,
-            spotify_id: artistData.spotify_id,
-            parent_batch_id: batch.id,
-            source: 'pipeline',
-            created_at: new Date().toISOString(),
-            correlation_id: correlationId
-          }
-        })
-        .select('id')
-        .single();
-      
-      if (batchError || !albumBatch) {
-        await logSystemEvent('error', 'handle_artist_batch', 
-          `Error creating album batch for artist ${artistData.name}`, 
-          { artistId: artistData.id, error: batchError?.message, correlationId },
-          correlationId
-        );
-        continue;
-      }
-      
-      // Add artist to the batch
-      const { error: itemError } = await supabase
-        .from('processing_items')
-        .insert({
-          batch_id: albumBatch.id,
-          item_type: 'artist',
-          item_id: artistData.id,
-          status: 'pending',
-          priority: 5,
-          metadata: {
-            artist_name: artistData.name,
-            spotify_id: artistData.spotify_id,
-            source: 'pipeline',
-            parent_batch_id: batch.id,
-            correlation_id: correlationId
-          }
-        });
-      
-      if (itemError) {
-        await logSystemEvent('error', 'handle_artist_batch', 
-          `Error adding artist to album batch: ${itemError.message}`, 
-          { artistId: artistData.id, batchId: albumBatch.id, correlationId },
-          correlationId
-        );
-        continue;
-      }
-      
-      await logSystemEvent('info', 'handle_artist_batch', 
-        `Created album batch ${albumBatch.id} for artist ${artistData.name}`, 
-        { artistId: artistData.id, batchId: albumBatch.id, correlationId },
-        correlationId
-      );
-      
-      // Call the album processing edge function asynchronously
-      edgeRuntime.waitUntil(
-        supabase.functions.invoke('process-album-dispatcher', {
-          body: {
-            batchId: albumBatch.id,
-            correlationId
-          }
-        })
-      );
-      
-      await incrementMetric('album_batches_created', 1, {
-        artist_id: artistData.id,
-        artist_name: artistData.name
-      });
-    }
-  } catch (error) {
-    await logSystemEvent('error', 'handle_artist_batch', 
-      `Error handling artist batch ${batch.id}: ${error.message}`, 
-      { batchId: batch.id, stack: error.stack, correlationId },
       correlationId
     );
   }

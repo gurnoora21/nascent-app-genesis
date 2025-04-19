@@ -23,8 +23,8 @@ verify_jwt = false
 [functions.process-track-page]
 verify_jwt = false
 
-# Additional pipeline functions
-[functions.process-artists-batch]
+# New pipeline functions
+[functions.discover-artists]
 verify_jwt = false
 
 [functions.monitor-pipeline]
@@ -39,8 +39,3 @@ verify_jwt = false
 [functions.reset-expired-batches]
 verify_jwt = false
 
-[functions.discover-artists]
-verify_jwt = false
-
-[functions.identify-producers]
-verify_jwt = false

@@ -40,17 +40,18 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
   batchId?: string;
 }> {
   try {
-    // Create a new processing batch
+    // Create a new processing batch for discovery
     const { data: batch, error: batchError } = await supabase
       .from("processing_batches")
       .insert({
-        batch_type: "process_artists",
+        batch_type: "discover_artists",
         status: "pending",
         metadata: {
           is_test_mode: isTestMode,
           created_from_client: true,
           created_at: new Date().toISOString(),
-          source: "client_request" 
+          source: "client_request",
+          specificArtistId: artistId
         }
       })
       .select("id")
@@ -64,40 +65,18 @@ export async function processArtist(artistId: string, isTestMode = false): Promi
       };
     }
     
-    // Add the artist to the batch
-    const { error: itemError } = await supabase
-      .from("processing_items")
-      .insert({
-        batch_id: batch.id,
-        item_type: "artist",
-        item_id: artistId,
-        status: "pending",
-        priority: 10, // High priority for manual requests
-        metadata: {
-          is_test_mode: isTestMode,
-          requested_at: new Date().toISOString(),
-          source: "client_request"
-        }
-      });
-    
-    if (itemError) {
-      console.error('Error adding artist to batch:', itemError);
-      return {
-        success: false,
-        message: `Error: ${itemError.message}`,
-      };
-    }
-    
-    // Trigger the processing function
-    const { data, error } = await supabase.functions.invoke("process-album-dispatcher", {
+    // Trigger the artist discovery function
+    const { data, error } = await supabase.functions.invoke("discover-artists", {
       body: {
         notifyOnCompletion: true,
-        clientRequestedBatchId: batch.id
+        specificArtistId: artistId,
+        batchId: batch.id,
+        isTestMode
       },
     });
     
     if (error) {
-      console.error('Error calling process-album-dispatcher function:', error);
+      console.error('Error calling discover-artists function:', error);
       return {
         success: false,
         message: `Error: ${error.message}`,
@@ -127,6 +106,8 @@ export async function getBatchStatus(batchId: string): Promise<{
     processed: number;
     failed: number;
     percentComplete: number;
+    currentStage?: string;
+    estimatedTimeRemaining?: number;
   };
   message?: string;
 }> {
@@ -151,10 +132,67 @@ export async function getBatchStatus(batchId: string): Promise<{
       };
     }
     
+    // Determine the current pipeline stage based on metadata flags
+    let currentStage = "initializing";
+    
+    if (batch.metadata?.pipeline_completed) {
+      currentStage = "completed";
+    } else if (batch.metadata?.producers_dispatched) {
+      currentStage = "processing_producers";
+    } else if (batch.metadata?.tracks_completed) {
+      currentStage = "tracks_completed";
+    } else if (batch.metadata?.tracks_dispatched) {
+      currentStage = "processing_tracks";
+    } else if (batch.metadata?.albums_completed) {
+      currentStage = "albums_completed";
+    } else if (batch.metadata?.albums_dispatched) {
+      currentStage = "processing_albums";
+    } else if (batch.metadata?.artists_completed) {
+      currentStage = "artists_completed";
+    } else if (batch.status === 'processing') {
+      currentStage = `processing_${batch.batch_type}`;
+    } else {
+      currentStage = `${batch.status}_${batch.batch_type}`;
+    }
+    
     const total = batch.items_total || 0;
     const processed = batch.items_processed || 0;
     const failed = batch.items_failed || 0;
     const percentComplete = total > 0 ? Math.round((processed / total) * 100) : 0;
+    
+    // Get hierarchy to estimate time remaining
+    const { hierarchy } = await getBatchHierarchy(batchId);
+    let estimatedTimeRemaining: number | undefined = undefined;
+    
+    if (hierarchy && hierarchy.children && hierarchy.children.length > 0) {
+      const childBatches = hierarchy.children;
+      const completedChildBatches = childBatches.filter(b => 
+        b.status === 'completed' || b.status === 'completed_with_next'
+      );
+      
+      if (completedChildBatches.length > 0 && completedChildBatches.length < childBatches.length) {
+        // Calculate average time per child batch
+        let totalCompletionTimeMs = 0;
+        let countedBatches = 0;
+        
+        for (const batch of completedChildBatches) {
+          if (batch.started_at && batch.completed_at) {
+            const startTime = new Date(batch.started_at).getTime();
+            const endTime = new Date(batch.completed_at).getTime();
+            if (endTime > startTime) {
+              totalCompletionTimeMs += (endTime - startTime);
+              countedBatches++;
+            }
+          }
+        }
+        
+        if (countedBatches > 0) {
+          const avgTimePerBatchMs = totalCompletionTimeMs / countedBatches;
+          const remainingBatches = childBatches.length - completedChildBatches.length;
+          estimatedTimeRemaining = Math.round((avgTimePerBatchMs * remainingBatches) / 1000); // in seconds
+        }
+      }
+    }
     
     return {
       success: true,
@@ -163,7 +201,9 @@ export async function getBatchStatus(batchId: string): Promise<{
         total,
         processed,
         failed,
-        percentComplete
+        percentComplete,
+        currentStage,
+        estimatedTimeRemaining
       }
     };
   } catch (error) {
@@ -251,8 +291,6 @@ export async function requeueDeadLetterItem(deadLetterId: string): Promise<{
     };
   }
 }
-
-// NEW FUNCTIONS - Added for enhanced monitoring and batch hierarchy
 
 // Get a full hierarchy of batches (parent batch + all child batches)
 export async function getBatchHierarchy(batchId: string): Promise<{
@@ -454,6 +492,7 @@ export async function monitorBatchProgress(batchId: string): Promise<{
     pagesTotal?: number;
     pagesCompleted?: number;
     estimatedTimeRemaining?: number;
+    currentStage?: string;
   };
   message?: string;
 }> {
@@ -466,6 +505,29 @@ export async function monitorBatchProgress(batchId: string): Promise<{
         success: false,
         message: `Error retrieving batch hierarchy for ${batchId}`
       };
+    }
+    
+    // Determine the current pipeline stage based on metadata flags
+    let currentStage = "initializing";
+    
+    if (hierarchy.metadata?.pipeline_completed) {
+      currentStage = "completed";
+    } else if (hierarchy.metadata?.producers_dispatched) {
+      currentStage = "processing_producers";
+    } else if (hierarchy.metadata?.tracks_completed) {
+      currentStage = "tracks_completed";
+    } else if (hierarchy.metadata?.tracks_dispatched) {
+      currentStage = "processing_tracks";
+    } else if (hierarchy.metadata?.albums_completed) {
+      currentStage = "albums_completed";
+    } else if (hierarchy.metadata?.albums_dispatched) {
+      currentStage = "processing_albums";
+    } else if (hierarchy.metadata?.artists_completed) {
+      currentStage = "artists_completed";
+    } else if (hierarchy.status === 'processing') {
+      currentStage = `processing_${hierarchy.batch_type}`;
+    } else {
+      currentStage = `${hierarchy.status}_${hierarchy.batch_type}`;
     }
     
     // Basic progress metrics from the batch itself
@@ -530,7 +592,8 @@ export async function monitorBatchProgress(batchId: string): Promise<{
         percentComplete,
         pagesTotal: pagesTotal > 0 ? pagesTotal : undefined,
         pagesCompleted: pagesCompleted > 0 ? pagesCompleted : undefined,
-        estimatedTimeRemaining: estimatedTimeRemaining > 0 ? estimatedTimeRemaining : undefined
+        estimatedTimeRemaining: estimatedTimeRemaining > 0 ? estimatedTimeRemaining : undefined,
+        currentStage
       }
     };
   } catch (error) {
@@ -609,6 +672,88 @@ export async function getPipelineAlerts(
       success: true,
       alerts: alerts || [],
       count: count || 0
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Start the pipeline by discovering artists
+export async function startArtistDiscovery(
+  options: {
+    genres?: string[];
+    limit?: number;
+    minPopularity?: number;
+    maxArtistsPerGenre?: number;
+    notifyOnCompletion?: boolean;
+  } = {}
+): Promise<{
+  success: boolean;
+  message: string;
+  batchId?: string;
+}> {
+  try {
+    // Set default values
+    const params = {
+      genres: options.genres || ['pop', 'rock', 'hip hop', 'electronic'],
+      limit: options.limit || 50,
+      minPopularity: options.minPopularity || 40,
+      maxArtistsPerGenre: options.maxArtistsPerGenre || 10,
+      notifyOnCompletion: options.notifyOnCompletion || false
+    };
+    
+    // Call the discover-artists function
+    const { data, error } = await supabase.functions.invoke("discover-artists", {
+      body: params
+    });
+    
+    if (error) {
+      return {
+        success: false,
+        message: `Error starting artist discovery: ${error.message}`
+      };
+    }
+    
+    return {
+      success: true,
+      message: `Artist discovery started successfully`,
+      batchId: data?.batchId
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Exception: ${error instanceof Error ? error.message : 'Unknown error'}`
+    };
+  }
+}
+
+// Reset a stalled or failed batch
+export async function resetBatch(batchId: string): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    // Call the monitor-pipeline function to reset and check the batch
+    const { data, error } = await supabase.functions.invoke("monitor-pipeline", {
+      body: {
+        specificBatchId: batchId,
+        resetBatch: true
+      }
+    });
+    
+    if (error) {
+      return {
+        success: false,
+        message: `Error resetting batch: ${error.message}`
+      };
+    }
+    
+    return {
+      success: true,
+      message: `Batch ${batchId} reset successfully`
     };
   } catch (error) {
     return {

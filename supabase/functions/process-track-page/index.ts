@@ -1,83 +1,87 @@
 
 import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
+import { supabase, SpotifyClient } from "../lib/api-clients.ts";
 import { 
   logSystemEvent, 
-  updateRateLimit, 
-  isApiRateLimited, 
-  calculateBackoffMs,
+  logProcessingError, 
+  formatSpotifyReleaseDate,
+  updateRateLimit,
+  isApiRateLimited,
   sleep,
+  checkCircuitBreaker,
   incrementMetric,
-  updateDataQualityScore,
-  formatSpotifyReleaseDate
+  generateCorrelationId
 } from "../lib/pipeline-utils.ts";
-import { supabase, spotify } from "../lib/api-clients.ts";
 
+// CORS headers
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
 };
 
-interface TrackPageRequest {
+interface ProcessTrackPageRequest {
   batchId: string;
-  offset?: number;
-  limit?: number;
-  albumId?: string;
+  albumId: string;
+  albumName?: string;
+  spotifyId: string;
+  offset: number;
+  limit: number;
   correlationId?: string;
   parentAlbumBatchId?: string;
-  pageIndex?: number;
-  totalPages?: number;
 }
 
-async function processTrackPage(request: TrackPageRequest): Promise<{
+async function processTrackPage(request: ProcessTrackPageRequest): Promise<{
   success: boolean;
   message: string;
-  batchId: string;
-  processed?: number;
-  failed?: number;
-  status?: string;
-  nextPageScheduled?: boolean;
+  nextOffset?: number;
+  totalTracks?: number;
+  processedTracks?: number;
+  isFinalPage?: boolean;
 }> {
-  const { batchId, correlationId } = request;
-  const processedTracks: string[] = [];
-  const failedTracks: string[] = [];
-  const startTime = Date.now();
-  const traceId = correlationId || crypto.randomUUID();
+  const { 
+    batchId, 
+    albumId, 
+    albumName = "Unknown Album", 
+    spotifyId, 
+    offset, 
+    limit, 
+    correlationId = generateCorrelationId(),
+    parentAlbumBatchId
+  } = request;
+  
+  // Create a worker ID for tracing
+  const workerId = crypto.randomUUID();
   
   try {
-    // Log start of processing
     await logSystemEvent('info', 'process_track_page', 
-      `Starting track page processing for batch ${batchId}`, 
-      { batchId, request, traceId },
-      traceId
+      `Starting track page processing for album ${albumName} (offset: ${offset}, limit: ${limit})`,
+      { 
+        workerId,
+        batchId, 
+        albumId, 
+        albumName, 
+        spotifyId, 
+        offset, 
+        limit,
+        correlationId,
+        parentAlbumBatchId
+      },
+      correlationId
     );
     
-    // Check API rate limits before proceeding
-    const apiLimited = await isApiRateLimited('spotify', '/tracks');
-    if (apiLimited) {
+    // Check if the Spotify API is rate limited
+    const isRateLimited = await checkCircuitBreaker('spotify');
+    if (isRateLimited) {
       await logSystemEvent('warning', 'process_track_page', 
-        `Spotify API is rate limited, delaying track page processing`, 
-        { batchId, traceId },
-        traceId
+        `Spotify API is rate limited, cannot process track page for ${albumName}`,
+        { albumId, spotifyId, correlationId },
+        correlationId
       );
       
       return {
-        success: true,
-        message: "API is currently rate limited, will retry later",
-        batchId,
-        status: "delayed"
+        success: false,
+        message: 'Spotify API is rate limited, try again later',
       };
-    }
-    
-    // Get batch details
-    const { data: batch, error: batchError } = await supabase
-      .from('processing_batches')
-      .select('*')
-      .eq('id', batchId)
-      .single();
-    
-    if (batchError || !batch) {
-      throw new Error(`Batch ${batchId} not found: ${batchError?.message || 'No data returned'}`);
     }
     
     // Mark batch as processing
@@ -85,250 +89,550 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       .from('processing_batches')
       .update({
         status: 'processing',
+        claimed_by: workerId,
         started_at: new Date().toISOString(),
         updated_at: new Date().toISOString()
       })
       .eq('id', batchId);
     
-    // Extract pagination parameters
-    const offset = request.offset || batch.metadata?.offset || 0;
-    const limit = request.limit || batch.metadata?.limit || 50;
-    const albumId = request.albumId || batch.metadata?.album_id;
-    const parentAlbumBatchId = request.parentAlbumBatchId || batch.metadata?.parent_album_batch_id;
-    const pageIndex = request.pageIndex || batch.metadata?.page_index || 0;
-    const totalPages = request.totalPages || batch.metadata?.total_pages || 1;
-    
-    // Get album details
+    // Get the album to find the artist
     const { data: album, error: albumError } = await supabase
       .from('albums')
-      .select('id, name, spotify_id, artist_id')
+      .select('artist_id, release_date')
       .eq('id', albumId)
       .single();
     
     if (albumError || !album) {
-      throw new Error(`Album ${albumId} not found: ${albumError?.message || 'No data returned'}`);
-    }
-
-    // Get artist details and fetch tracks from Spotify
-    const { data: artist, error: artistError } = await supabase
-      .from('artists')
-      .select('id, name')
-      .eq('id', album.artist_id)
-      .single();
-    
-    if (artistError) {
-      await logSystemEvent('warning', 'process_track_page', 
-        `Artist not found for album ${album.name}: ${artistError.message}`, 
-        { albumId, album: album.name, artistId: album.artist_id, traceId },
-        traceId
+      await logSystemEvent('error', 'process_track_page', 
+        `Error getting album ${albumId}: ${albumError?.message || 'Album not found'}`,
+        { albumId, spotifyId, offset, limit, correlationId },
+        correlationId
       );
-      // Continue anyway, we can still process tracks
-    }
-    
-    const artistName = artist?.name || 'Unknown';
-    
-    // Fetch tracks from Spotify
-    await logSystemEvent('info', 'process_track_page', 
-      `Fetching tracks for album ${album.name} by ${artistName} (offset: ${offset}, limit: ${limit}, page ${pageIndex+1}/${totalPages})`, 
-      { albumId, albumName: album.name, artistName, offset, limit, pageIndex, totalPages, traceId },
-      traceId
-    );
-    
-    const { tracks, error: spotifyError } = await getAlbumTracks(
-      album.spotify_id, 
-      offset, 
-      limit,
-      traceId
-    );
-    
-    if (spotifyError) {
-      throw new Error(`Error fetching tracks from Spotify: ${spotifyError.message}`);
-    }
-    
-    let isFinal = false;
-    
-    if (!tracks || tracks.length === 0) {
-      isFinal = true;
       
-      const finalStatus = {
-        status: 'completed',
-        items_total: 0,
-        items_processed: 0,
-        items_failed: 0,
-        completed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        metadata: {
-          ...batch.metadata,
-          is_final_page: true,
-          processing_time_ms: Date.now() - startTime,
-          success_rate: 1,
-          offset,
-          limit,
-          page_index: pageIndex,
-          total_pages: totalPages
-        }
-      };
-
+      // Mark batch as errored
       await supabase
         .from('processing_batches')
-        .update(finalStatus)
+        .update({
+          status: 'error',
+          error_message: `Error getting album: ${albumError?.message || 'Album not found'}`,
+          updated_at: new Date().toISOString()
+        })
         .eq('id', batchId);
-
-      // Since this is the final page (no tracks found), update parent album batch
-      if (parentAlbumBatchId) {
-        edgeRuntime.waitUntil(
-          updateParentAlbumBatch(parentAlbumBatchId, albumId, traceId)
-        );
-      }
-
+      
       return {
-        success: true,
-        message: `No tracks found for album ${album.name} at offset ${offset}`,
-        batchId,
-        processed: 0,
-        failed: 0,
-        status: 'completed'
+        success: false,
+        message: `Error getting album: ${albumError?.message || 'Album not found'}`
       };
     }
     
-    // Process tracks in smaller batches
-    const batchSize = 10;
-    const trackBatches = [];
+    const artistId = album.artist_id;
     
-    for (let i = 0; i < tracks.length; i += batchSize) {
-      trackBatches.push(tracks.slice(i, i + batchSize));
-    }
+    // Create Spotify client
+    const spotify = new SpotifyClient();
     
-    for (const trackBatch of trackBatches) {
-      const processingPromises = trackBatch.map(track => 
-        processTrack(track, album.id, album.artist_id, traceId)
-          .then(result => {
-            if (result.success) {
-              processedTracks.push(track.id);
-            } else {
-              failedTracks.push(track.id);
-            }
-            return result;
-          })
+    // Fetch tracks for this page
+    const response = await spotify.getAlbumTracks(
+      spotifyId,
+      {
+        limit,
+        offset,
+        market: 'US'
+      }
+    );
+    
+    if (response.error) {
+      await logSystemEvent('error', 'process_track_page', 
+        `Error fetching tracks for album ${albumName}: ${response.error.message}`,
+        { albumId, spotifyId, offset, limit, correlationId, response: response.error },
+        correlationId
       );
       
-      await Promise.all(processingPromises);
+      // Mark batch as errored
+      await supabase
+        .from('processing_batches')
+        .update({
+          status: 'error',
+          error_message: `Error fetching tracks: ${response.error.message}`,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', batchId);
       
-      // Small delay between batches
-      await sleep(200);
+      return {
+        success: false,
+        message: `Error fetching tracks: ${response.error.message}`
+      };
+    }
+    
+    const { data: tracksData } = response;
+    
+    if (!tracksData || !tracksData.items || tracksData.items.length === 0) {
+      await logSystemEvent('info', 'process_track_page', 
+        `No tracks found for album ${albumName} at offset ${offset}`,
+        { albumId, spotifyId, offset, limit, correlationId },
+        correlationId
+      );
+      
+      // Mark batch as completed and final
+      await supabase
+        .from('processing_batches')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          items_total: 0,
+          items_processed: 0,
+          metadata: {
+            album_id: albumId,
+            album_name: albumName,
+            spotify_id: spotifyId,
+            artist_id: artistId,
+            offset,
+            limit,
+            is_final_page: true,
+            total_tracks: tracksData.total || 0,
+            correlation_id: correlationId,
+            parent_album_batch_id: parentAlbumBatchId
+          }
+        })
+        .eq('id', batchId);
+      
+      return {
+        success: true,
+        message: 'No tracks found for this album',
+        totalTracks: tracksData.total || 0,
+        processedTracks: 0,
+        isFinalPage: true
+      };
+    }
+    
+    const tracks = tracksData.items;
+    const total = tracksData.total || tracks.length;
+    
+    await logSystemEvent('info', 'process_track_page', 
+      `Found ${tracks.length} tracks for album ${albumName} (offset: ${offset}, total: ${total})`,
+      { albumId, spotifyId, trackCount: tracks.length, offset, limit, total, correlationId },
+      correlationId
+    );
+    
+    // Process each track in this page
+    let processedCount = 0;
+    for (const track of tracks) {
+      try {
+        // Check if track already exists
+        const { data: existingTrack, error: checkError } = await supabase
+          .from('tracks')
+          .select('id')
+          .eq('spotify_id', track.id)
+          .maybeSingle();
+        
+        if (checkError && checkError.code !== 'PGRST116') {
+          console.error(`Error checking for existing track ${track.id}:`, checkError);
+          continue;
+        }
+        
+        let trackId: string;
+        if (existingTrack) {
+          // Update the existing track
+          const { error: updateError } = await supabase
+            .from('tracks')
+            .update({
+              name: track.name,
+              popularity: track.popularity,
+              spotify_url: track.external_urls?.spotify,
+              preview_url: track.preview_url,
+              updated_at: new Date().toISOString(),
+              metadata: {
+                ...track,
+                updated_at: new Date().toISOString(),
+                correlation_id: correlationId
+              }
+            })
+            .eq('id', existingTrack.id);
+          
+          if (updateError) {
+            console.error(`Error updating track ${track.id}:`, updateError);
+            continue;
+          }
+          
+          trackId = existingTrack.id;
+        } else {
+          // Insert a new track
+          const { data: newTrack, error: insertError } = await supabase
+            .from('tracks')
+            .insert({
+              name: track.name,
+              artist_id: artistId,
+              spotify_id: track.id,
+              spotify_url: track.external_urls?.spotify,
+              preview_url: track.preview_url,
+              popularity: track.popularity,
+              release_date: album.release_date,
+              metadata: {
+                ...track,
+                created_at: new Date().toISOString(),
+                correlation_id: correlationId
+              }
+            })
+            .select('id')
+            .single();
+          
+          if (insertError) {
+            console.error(`Error inserting track ${track.id}:`, insertError);
+            continue;
+          }
+          
+          trackId = newTrack.id;
+        }
+        
+        // Now link the track to the album via track_albums
+        const { data: existingLink, error: linkCheckError } = await supabase
+          .from('track_albums')
+          .select('id')
+          .eq('track_id', trackId)
+          .eq('album_id', albumId)
+          .maybeSingle();
+        
+        if (linkCheckError && linkCheckError.code !== 'PGRST116') {
+          console.error(`Error checking for existing album-track link:`, linkCheckError);
+        } else if (!existingLink) {
+          // Create the link if it doesn't exist
+          const { error: linkError } = await supabase
+            .from('track_albums')
+            .insert({
+              track_id: trackId,
+              album_id: albumId,
+              track_number: track.track_number,
+              disc_number: track.disc_number
+            });
+          
+          if (linkError) {
+            console.error(`Error linking track to album:`, linkError);
+          }
+        }
+        
+        // Link the track to its artists via track_artists
+        if (track.artists && track.artists.length > 0) {
+          for (const artist of track.artists) {
+            try {
+              // First check if this artist exists in our database
+              const { data: dbArtist, error: artistCheckError } = await supabase
+                .from('artists')
+                .select('id')
+                .eq('spotify_id', artist.id)
+                .maybeSingle();
+              
+              let artistDbId: string;
+              if (artistCheckError && artistCheckError.code !== 'PGRST116') {
+                console.error(`Error checking for artist ${artist.id}:`, artistCheckError);
+                continue;
+              }
+              
+              if (!dbArtist) {
+                // Insert a minimal artist entry if not found
+                const { data: newArtist, error: artistInsertError } = await supabase
+                  .from('artists')
+                  .insert({
+                    name: artist.name,
+                    spotify_id: artist.id,
+                    spotify_url: artist.external_urls?.spotify,
+                    metadata: {
+                      ...artist,
+                      created_at: new Date().toISOString(),
+                      correlation_id: correlationId,
+                      source: 'track_processing'
+                    }
+                  })
+                  .select('id')
+                  .single();
+                
+                if (artistInsertError) {
+                  console.error(`Error inserting artist ${artist.id}:`, artistInsertError);
+                  continue;
+                }
+                
+                artistDbId = newArtist.id;
+              } else {
+                artistDbId = dbArtist.id;
+              }
+              
+              // Check if the track-artist link already exists
+              const { data: existingArtistLink, error: artistLinkCheckError } = await supabase
+                .from('track_artists')
+                .select('id')
+                .eq('track_id', trackId)
+                .eq('artist_id', artistDbId)
+                .maybeSingle();
+              
+              if (artistLinkCheckError && artistLinkCheckError.code !== 'PGRST116') {
+                console.error(`Error checking for track-artist link:`, artistLinkCheckError);
+              } else if (!existingArtistLink) {
+                // Create the link if it doesn't exist
+                const { error: artistLinkError } = await supabase
+                  .from('track_artists')
+                  .insert({
+                    track_id: trackId,
+                    artist_id: artistDbId,
+                    is_primary: artist.id === track.artists[0].id // First artist is primary
+                  });
+                
+                if (artistLinkError) {
+                  console.error(`Error linking track to artist:`, artistLinkError);
+                }
+              }
+            } catch (artistError) {
+              console.error(`Error processing artist ${artist.name} for track:`, artistError);
+            }
+          }
+        }
+        
+        // Add track to processing batch items for tracking
+        await supabase
+          .from('processing_items')
+          .insert({
+            batch_id: batchId,
+            item_type: 'track',
+            item_id: trackId,
+            status: 'completed',
+            metadata: {
+              track_name: track.name,
+              spotify_id: track.id,
+              album_id: albumId,
+              correlation_id: correlationId
+            }
+          });
+        
+        processedCount++;
+      } catch (error) {
+        console.error(`Error processing track ${track.id}:`, error);
+        await logProcessingError(
+          'track_processing',
+          'process_track_page',
+          `Error processing track ${track.name}`,
+          error,
+          {
+            albumId,
+            spotifyId: track.id,
+            trackName: track.name,
+            correlationId
+          }
+        );
+      }
     }
     
     // Determine if this is the final page
-    isFinal = tracks.length < limit || (pageIndex === totalPages - 1);
+    const isFinalPage = offset + tracks.length >= total;
+    const nextOffset = offset + limit;
     
-    // Calculate success metrics
-    const successRate = processedTracks.length / tracks.length;
-    
-    // Update batch status with pagination metadata
-    const batchStatus = {
-      status: isFinal ? 'completed' : 'completed_with_next',
-      metadata: {
-        ...batch.metadata,
-        offset,
-        limit,
-        page_index: pageIndex,
-        total_pages: totalPages,
-        is_final_page: isFinal,
-        next_page_offset: isFinal ? null : offset + limit,
-        processing_time_ms: Date.now() - startTime,
-        success_rate: successRate,
-        album_id: albumId,
-        parent_album_batch_id: parentAlbumBatchId
-      },
-      items_total: tracks.length,
-      items_processed: processedTracks.length,
-      items_failed: failedTracks.length,
-      completed_at: new Date().toISOString(),
-      updated_at: new Date().toISOString()
-    };
-
-    await supabase
-      .from('processing_batches')
-      .update(batchStatus)
-      .eq('id', batchId);
-
-    // Schedule next page processing if not final
-    let nextPageScheduled = false;
-    if (!isFinal) {
-      const nextOffset = offset + limit;
-      const nextPageIndex = pageIndex + 1;
+    // Update batch status based on whether there are more pages
+    if (isFinalPage) {
+      // This is the last page
+      await supabase
+        .from('processing_batches')
+        .update({
+          status: 'completed',
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          items_total: tracks.length,
+          items_processed: processedCount,
+          metadata: {
+            album_id: albumId,
+            album_name: albumName,
+            spotify_id: spotifyId,
+            artist_id: artistId,
+            offset,
+            limit,
+            is_final_page: true,
+            total_tracks: total,
+            processed_tracks: processedCount,
+            correlation_id: correlationId,
+            parent_album_batch_id: parentAlbumBatchId
+          }
+        })
+        .eq('id', batchId);
       
-      edgeRuntime.waitUntil(
-        supabase.from('processing_batches')
-          .insert({
-            batch_type: 'process_track_page',
-            status: 'pending',
-            metadata: {
-              album_id: albumId,
-              album_name: album.name,
-              parent_album_batch_id: parentAlbumBatchId,
+      await logSystemEvent('info', 'process_track_page', 
+        `Completed final track page for album ${albumName} (processed ${processedCount}/${tracks.length})`,
+        { 
+          albumId, 
+          spotifyId,
+          batchId,
+          offset, 
+          total,
+          processedCount,
+          correlationId,
+          parentAlbumBatchId
+        },
+        correlationId
+      );
+      
+      // Update the album's track count if needed
+      await supabase
+        .from('albums')
+        .update({
+          total_tracks: total,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', albumId);
+      
+      // Notify monitor to check for completion of all track pages
+      EdgeRuntime.waitUntil(
+        supabase.functions.invoke('monitor-pipeline', {
+          body: {
+            specificBatchId: batchId,
+            correlationId
+          }
+        })
+      );
+    } else {
+      // This is not the last page, mark as completed_with_next and schedule the next page
+      await supabase
+        .from('processing_batches')
+        .update({
+          status: 'completed_with_next',
+          completed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          items_total: tracks.length,
+          items_processed: processedCount,
+          metadata: {
+            album_id: albumId,
+            album_name: albumName,
+            spotify_id: spotifyId,
+            artist_id: artistId,
+            offset,
+            limit,
+            next_offset: nextOffset,
+            is_final_page: false,
+            total_tracks: total,
+            processed_tracks: processedCount,
+            correlation_id: correlationId,
+            parent_album_batch_id: parentAlbumBatchId
+          }
+        })
+        .eq('id', batchId);
+      
+      await logSystemEvent('info', 'process_track_page', 
+        `Completed track page for album ${albumName}, scheduling next page at offset ${nextOffset}`,
+        { 
+          albumId, 
+          spotifyId, 
+          batchId,
+          offset, 
+          nextOffset, 
+          total,
+          processedCount,
+          correlationId,
+          parentAlbumBatchId
+        },
+        correlationId
+      );
+      
+      // Schedule next page
+      EdgeRuntime.waitUntil(async () => {
+        try {
+          // Create a new batch for the next page
+          const { data: nextBatch, error: batchError } = await supabase
+            .from('processing_batches')
+            .insert({
+              batch_type: 'process_track_page',
+              status: 'pending',
+              metadata: {
+                album_id: albumId,
+                album_name: albumName,
+                spotify_id: spotifyId,
+                artist_id: artistId,
+                offset: nextOffset,
+                limit,
+                page_index: Math.floor(nextOffset / limit),
+                parent_album_batch_id: parentAlbumBatchId,
+                correlation_id: correlationId,
+                created_at: new Date().toISOString()
+              }
+            })
+            .select('id')
+            .single();
+          
+          if (batchError || !nextBatch) {
+            await logSystemEvent('error', 'process_track_page', 
+              `Error creating next page batch: ${batchError?.message || 'Unknown error'}`,
+              { 
+                albumId, 
+                spotifyId, 
+                offset: nextOffset, 
+                limit,
+                correlationId,
+                parentAlbumBatchId
+              },
+              correlationId
+            );
+            return;
+          }
+          
+          // Give a small delay to avoid overwhelming the API or database
+          await sleep(500);
+          
+          // Call process-track-page for the next batch
+          await supabase.functions.invoke('process-track-page', {
+            body: {
+              batchId: nextBatch.id,
+              albumId,
+              albumName,
+              spotifyId,
               offset: nextOffset,
               limit,
-              page_index: nextPageIndex,
-              total_pages: totalPages,
-              correlation_id: traceId,
-              source: 'pagination'
+              correlationId,
+              parentAlbumBatchId
             }
-          })
-          .then(async ({ data: nextBatch, error: nextPageError }) => {
-            if (nextPageError) {
-              await logSystemEvent('error', 'process_track_page',
-                `Error scheduling next page: ${nextPageError.message}`,
-                { albumId, offset: nextOffset, pageIndex: nextPageIndex, traceId },
-                traceId
-              );
-            } else if (nextBatch) {
-              await logSystemEvent('info', 'process_track_page',
-                `Scheduled next page batch: ${nextBatch[0].id}`,
-                { 
-                  albumId, 
-                  nextBatchId: nextBatch[0].id, 
-                  offset: nextOffset, 
-                  pageIndex: nextPageIndex, 
-                  traceId 
-                },
-                traceId
-              );
-            }
-          })
-      );
-      
-      nextPageScheduled = true;
+          });
+        } catch (error) {
+          await logSystemEvent('error', 'process_track_page', 
+            `Error scheduling next page: ${error.message}`,
+            { 
+              albumId, 
+              spotifyId, 
+              offset: nextOffset, 
+              limit,
+              correlationId,
+              parentAlbumBatchId,
+              error: error.stack
+            },
+            correlationId
+          );
+        }
+      });
     }
-
-    // If this was the final page, trigger parent album batch update
-    if (isFinal && parentAlbumBatchId) {
-      edgeRuntime.waitUntil(
-        updateParentAlbumBatch(parentAlbumBatchId, albumId, traceId)
-      );
-    }
-
+    
+    // Track metrics
+    await incrementMetric('tracks_processed', processedCount, {
+      album_id: albumId,
+      batch_id: batchId,
+      is_final_page: isFinalPage
+    });
+    
     return {
       success: true,
-      message: `Processed ${processedTracks.length} tracks, failed ${failedTracks.length} tracks${nextPageScheduled ? ', scheduled next page' : ''}`,
-      batchId,
-      processed: processedTracks.length,
-      failed: failedTracks.length,
-      status: batchStatus.status,
-      nextPageScheduled
+      message: `Processed ${processedCount} tracks for album ${albumName}`,
+      nextOffset: isFinalPage ? undefined : nextOffset,
+      totalTracks: total,
+      processedTracks: processedCount,
+      isFinalPage
     };
-    
   } catch (error) {
-    // Log error
-    console.error('Error in processTrackPage:', error);
-    
     await logSystemEvent('error', 'process_track_page', 
-      `Error processing track page: ${error.message}`, 
-      { batchId, stack: error.stack, traceId },
-      traceId
+      `Error processing track page: ${error.message}`,
+      { 
+        batchId, 
+        albumId, 
+        spotifyId, 
+        offset, 
+        limit,
+        correlationId,
+        parentAlbumBatchId,
+        error: error.stack
+      },
+      correlationId
     );
     
-    // Update batch status
+    // Mark batch as error
     await supabase
       .from('processing_batches')
       .update({
@@ -338,423 +642,46 @@ async function processTrackPage(request: TrackPageRequest): Promise<{
       })
       .eq('id', batchId);
     
-    // Track error metrics
-    await incrementMetric('track_page_errors', 1, {
-      batch_id: batchId,
-      error_type: error.name,
-      error_message: error.message.substring(0, 100)  // Limit message length
-    });
-    
     return {
       success: false,
-      message: `Error processing track page: ${error.message}`,
-      batchId,
-      processed: processedTracks.length,
-      failed: failedTracks.length,
-      status: 'error'
+      message: `Error processing track page: ${error.message}`
     };
-  }
-}
-
-async function getAlbumTracks(
-  spotifyId: string, 
-  offset: number, 
-  limit: number,
-  traceId: string
-): Promise<{ tracks?: any[]; error?: Error }> {
-  try {
-    const response = await spotify.getAlbumTracks(
-      spotifyId, 
-      {
-        offset,
-        limit,
-        market: 'US'  // Prioritize US market for consistency
-      }
-    );
-    
-    // Update rate limits
-    if (response.headers) {
-      await updateRateLimit(
-        'spotify',
-        '/tracks',
-        response.headers,
-        { status: response.status }
-      );
-    }
-    
-    // Check for errors
-    if (!response.data || !response.data.items) {
-      return { 
-        error: new Error(`No tracks data returned from Spotify. Status: ${response.status}`) 
-      };
-    }
-    
-    return { tracks: response.data.items };
-  } catch (error) {
-    // Log the error
-    await logSystemEvent('error', 'get_album_tracks', 
-      `Error fetching tracks from Spotify: ${error.message}`, 
-      { spotifyId, offset, limit, stack: error.stack, traceId },
-      traceId
-    );
-    
-    return { error };
-  }
-}
-
-async function processTrack(
-  spotifyTrack: any, 
-  albumId: string,
-  artistId: string,
-  traceId: string
-): Promise<{ success: boolean; message: string; trackId?: string }> {
-  try {
-    // Prepare track data
-    const trackData = {
-      name: spotifyTrack.name,
-      spotify_id: spotifyTrack.id,
-      artist_id: artistId,  // Main artist ID
-      preview_url: spotifyTrack.preview_url,
-      spotify_url: spotifyTrack.external_urls?.spotify || null,
-      popularity: spotifyTrack.popularity,
-      metadata: {
-        processed_at: new Date().toISOString(),
-        trace_id: traceId,
-        uri: spotifyTrack.uri,
-        duration_ms: spotifyTrack.duration_ms,
-        explicit: spotifyTrack.explicit,
-        disc_number: spotifyTrack.disc_number,
-        track_number: spotifyTrack.track_number
-      }
-    };
-    
-    // Upsert track
-    const { data: track, error: trackError } = await supabase
-      .from('tracks')
-      .upsert(trackData, { 
-        onConflict: 'spotify_id',
-        ignoreDuplicates: false  // Update if exists
-      })
-      .select('id')
-      .single();
-    
-    if (trackError) {
-      throw new Error(`Error upserting track: ${trackError.message}`);
-    }
-    
-    if (!track) {
-      throw new Error('No track data returned after upsert');
-    }
-    
-    // Add relationship to album (track_albums junction table)
-    const trackAlbumData = {
-      track_id: track.id,
-      album_id: albumId,
-      disc_number: spotifyTrack.disc_number,
-      track_number: spotifyTrack.track_number
-    };
-    
-    const { error: relationError } = await supabase
-      .from('track_albums')
-      .upsert(trackAlbumData, {
-        onConflict: 'track_id,album_id'
-      });
-    
-    if (relationError) {
-      throw new Error(`Error linking track to album: ${relationError.message}`);
-    }
-    
-    // Add relationships to artists (track_artists junction table)
-    if (spotifyTrack.artists && spotifyTrack.artists.length > 0) {
-      // Process each artist
-      for (const artist of spotifyTrack.artists) {
-        // Check if this artist exists
-        const { data: existingArtist } = await supabase
-          .from('artists')
-          .select('id')
-          .eq('spotify_id', artist.id)
-          .maybeSingle();
-        
-        let artistId = existingArtist?.id;
-        
-        // If artist doesn't exist, create a stub record
-        if (!artistId) {
-          const { data: newArtist, error: artistCreateError } = await supabase
-            .from('artists')
-            .insert({
-              name: artist.name,
-              spotify_id: artist.id,
-              spotify_url: artist.external_urls?.spotify,
-              metadata: {
-                stub: true,
-                created_from_track: true,
-                trace_id: traceId,
-                created_at: new Date().toISOString()
-              }
-            })
-            .select('id')
-            .single();
-          
-          if (artistCreateError) {
-            console.error(`Error creating artist stub for ${artist.name}:`, artistCreateError);
-            continue;
-          }
-          
-          artistId = newArtist.id;
-        }
-        
-        // Add track-artist relationship
-        if (artistId) {
-          const { error: artistRelationError } = await supabase
-            .from('track_artists')
-            .upsert({
-              track_id: track.id,
-              artist_id: artistId,
-              is_primary: artist.id === spotifyTrack.artists[0].id  // First artist is primary
-            }, {
-              onConflict: 'track_id,artist_id'
-            });
-          
-          if (artistRelationError) {
-            console.error(`Error linking track to artist ${artist.name}:`, artistRelationError);
-          }
-        }
-      }
-    }
-    
-    // Calculate data quality score
-    const qualityScore = calculateTrackQualityScore(spotifyTrack);
-    
-    // Update data quality
-    await updateDataQualityScore(
-      'track',
-      track.id,
-      'spotify',
-      qualityScore,
-      undefined,
-      undefined,
-      {
-        updated_at: new Date().toISOString(),
-        trace_id: traceId
-      }
-    );
-    
-    // Track metrics
-    await incrementMetric('tracks_processed', 1, {
-      has_preview: spotifyTrack.preview_url ? true : false,
-      is_explicit: spotifyTrack.explicit,
-      artist_count: spotifyTrack.artists?.length || 1
-    });
-    
-    return {
-      success: true,
-      message: `Processed track: ${spotifyTrack.name}`,
-      trackId: track.id
-    };
-  } catch (error) {
-    // Log error
-    await logSystemEvent('error', 'process_track', 
-      `Error processing track ${spotifyTrack.name}: ${error.message}`, 
-      { trackName: spotifyTrack.name, stack: error.stack, traceId },
-      traceId
-    );
-    
-    // Track error metrics
-    await incrementMetric('track_processing_errors', 1, {
-      error_type: error.name,
-      track_name: spotifyTrack.name.substring(0, 50)
-    });
-    
-    return {
-      success: false,
-      message: `Error processing track: ${error.message}`
-    };
-  }
-}
-
-function calculateTrackQualityScore(track: any): number {
-  let score = 0.5; // Base score
-  
-  // Add points for various fields being present
-  if (track.name) score += 0.1;
-  if (track.preview_url) score += 0.15;  // Preview URL is valuable
-  if (track.external_urls?.spotify) score += 0.05;
-  if (track.duration_ms) score += 0.05;
-  if (track.artists && track.artists.length > 0) score += 0.1;
-  if (track.disc_number) score += 0.025;
-  if (track.track_number) score += 0.025;
-  
-  // Cap at 1.0
-  return Math.min(score, 1.0);
-}
-
-async function updateParentAlbumBatch(
-  parentBatchId: string,
-  albumId: string,
-  traceId: string
-): Promise<void> {
-  try {
-    // Get all track page batches for this album
-    const { data: trackBatches, error: batchError } = await supabase
-      .from('processing_batches')
-      .select('id, status, metadata')
-      .eq('batch_type', 'process_track_page')
-      .eq('metadata->parent_album_batch_id', parentBatchId)
-      .eq('metadata->album_id', albumId);
-    
-    if (batchError) {
-      throw new Error(`Error checking track batches: ${batchError.message}`);
-    }
-
-    if (!trackBatches || trackBatches.length === 0) {
-      await logSystemEvent('warning', 'update_parent_album_batch',
-        `No track page batches found for album ${albumId}`,
-        { parentBatchId, albumId, traceId },
-        traceId
-      );
-      return;
-    }
-
-    // Check if all track pages are completed and find the final page
-    const allCompleted = trackBatches.every(batch => 
-      batch.status === 'completed' || batch.status === 'completed_with_next' || batch.status === 'error'
-    );
-
-    const hasFinalPage = trackBatches.some(batch => 
-      batch.metadata?.is_final_page === true
-    );
-
-    if (allCompleted && hasFinalPage) {
-      await logSystemEvent('info', 'update_parent_album_batch',
-        `All track pages completed for album ${albumId}`,
-        { parentBatchId, albumId, batchCount: trackBatches.length, traceId },
-        traceId
-      );
-      
-      // Update the album item in parent batch as completed
-      const { data: albumItems, error: itemsError } = await supabase
-        .from('processing_items')
-        .select('id')
-        .eq('batch_id', parentBatchId)
-        .eq('item_id', albumId)
-        .eq('item_type', 'album_for_tracks');
-      
-      if (!itemsError && albumItems && albumItems.length > 0) {
-        await supabase
-          .from('processing_items')
-          .update({
-            status: 'completed',
-            updated_at: new Date().toISOString(),
-            metadata: {
-              tracks_completed_at: new Date().toISOString(),
-              tracks_correlation_id: traceId
-            }
-          })
-          .eq('id', albumItems[0].id);
-      }
-      
-      // Check if all albums in the batch are now completed
-      const { data: allItems, error: allItemsError } = await supabase
-        .from('processing_items')
-        .select('id, status')
-        .eq('batch_id', parentBatchId);
-      
-      if (!allItemsError && allItems) {
-        const allItemsCompleted = allItems.every(item => 
-          item.status === 'completed' || item.status === 'error'
-        );
-        
-        if (allItemsCompleted) {
-          // All albums are completed, mark the parent batch as completed
-          await supabase
-            .from('processing_batches')
-            .update({
-              status: 'tracks_completed',
-              completed_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-              metadata: {
-                tracks_completed_at: new Date().toISOString(),
-                tracks_correlation_id: traceId
-              }
-            })
-            .eq('id', parentBatchId);
-          
-          await logSystemEvent('info', 'update_parent_album_batch',
-            `Marked parent batch ${parentBatchId} as tracks_completed`,
-            { parentBatchId, traceId },
-            traceId
-          );
-        }
-      }
-    }
-  } catch (error) {
-    await logSystemEvent('error', 'update_parent_album_batch',
-      `Error updating parent album batch: ${error.message}`,
-      { parentBatchId, albumId, stack: error.stack, traceId },
-      traceId
-    );
   }
 }
 
 serve(async (req) => {
   // Handle CORS preflight requests
   if (req.method === 'OPTIONS') {
-    return new Response(null, { headers: corsHeaders, status: 204 });
+    return new Response(null, { headers: corsHeaders });
   }
 
   try {
-    let request: TrackPageRequest;
+    // Parse request body
+    const request: ProcessTrackPageRequest = await req.json();
     
-    if (req.method === 'POST') {
-      // Parse request body
-      try {
-        request = await req.json();
-      } catch (error) {
-        return new Response(
-          JSON.stringify({ 
-            success: false, 
-            message: `Invalid request body: ${error.message}` 
-          }),
-          { 
-            status: 400, 
-            headers: { 
-              'Content-Type': 'application/json',
-              ...corsHeaders 
-            } 
-          }
-        );
-      }
-    } else {
-      // Parse URL parameters
-      const url = new URL(req.url);
-      request = {
-        batchId: url.searchParams.get('batchId') || '',
-        offset: parseInt(url.searchParams.get('offset') || '0'),
-        limit: parseInt(url.searchParams.get('limit') || '50'),
-        albumId: url.searchParams.get('albumId') || undefined,
-        correlationId: url.searchParams.get('correlationId') || undefined,
-        parentAlbumBatchId: url.searchParams.get('parentAlbumBatchId') || undefined,
-        pageIndex: parseInt(url.searchParams.get('pageIndex') || '0'),
-        totalPages: parseInt(url.searchParams.get('totalPages') || '1')
-      };
-    }
-    
-    if (!request.batchId) {
+    // Validate required parameters
+    if (!request.batchId || !request.albumId || !request.spotifyId) {
       return new Response(
-        JSON.stringify({ 
-          success: false, 
-          message: 'Missing required parameter: batchId' 
+        JSON.stringify({
+          success: false,
+          message: 'Missing required parameters: batchId, albumId, and spotifyId are required'
         }),
-        { 
-          status: 400, 
-          headers: { 
+        {
+          status: 400,
+          headers: {
             'Content-Type': 'application/json',
-            ...corsHeaders 
-          } 
+            ...corsHeaders
+          }
         }
       );
     }
     
+    // Default values for optional parameters
+    request.offset = request.offset || 0;
+    request.limit = request.limit || 50;
+    request.correlationId = request.correlationId || generateCorrelationId();
+    
+    // Process the track page
     const result = await processTrackPage(request);
     
     return new Response(
@@ -763,37 +690,24 @@ serve(async (req) => {
         status: result.success ? 200 : 500,
         headers: {
           'Content-Type': 'application/json',
-          ...corsHeaders,
-        },
+          ...corsHeaders
+        }
       }
     );
   } catch (error) {
-    console.error('Error handling process-track-page request:', error);
+    console.error('Error processing request:', error);
     
-    // Log error to our database
-    try {
-      await supabase.rpc('log_error', {
-        p_error_type: 'endpoint',
-        p_source: 'process_track_page',
-        p_message: 'Error handling process-track-page request',
-        p_stack_trace: error.stack || '',
-        p_context: { error: error.message },
-      });
-    } catch (logError) {
-      console.error('Error logging to database:', logError);
-    }
-
     return new Response(
       JSON.stringify({
         success: false,
-        error: error.message,
+        message: `Error processing request: ${error.message}`
       }),
       {
         status: 500,
         headers: {
           'Content-Type': 'application/json',
-          ...corsHeaders,
-        },
+          ...corsHeaders
+        }
       }
     );
   }
