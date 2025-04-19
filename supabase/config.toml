@@ -30,9 +30,6 @@ verify_jwt = false
 [functions.monitor-pipeline]
 verify_jwt = false
 
-[functions.process-producers-batch]
-verify_jwt = false
-
 [functions.requeue-dead-letter]
 verify_jwt = false
 
